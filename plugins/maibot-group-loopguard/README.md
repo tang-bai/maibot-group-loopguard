@@ -23,7 +23,7 @@
 ## 安装
 
 把整个 `maibot-group-loopguard/` 目录放进 MaiBot 的 `plugins/` 下，重载插件即可。
-首次加载会在插件目录生成 `config.toml`，也可以直接在 WebUI 插件配置页改。
+首次加载会在插件目录生成 `config.toml`，也可以直接在 WebUI 插件配置页改。配置页字段均为中文显示名，`config.toml` 的键名保持英文。
 
 依赖：MaiBot `1.3.x` + `maibot-plugin-sdk >= 2.0.0`（Host 自带 Runner 会拉起依赖）。
 

@@ -1,5 +1,12 @@
 # CHANGELOG
 
+## 1.0.1
+
+- 配置页汉化：39 个字段全部补上中文显示名（`json_schema_extra={"label": ...}`），WebUI 不再显示 `window_seconds`、`bigram_containment_threshold` 这类键名；悬停说明同步精简。
+- 新增 `tests/test_config_labels.py`：装了真实 `maibot-plugin-sdk` 时校验「每个字段都有中文名 / 配置节标题是中文 / 字段总数与文档一致」，未装 SDK 时自动跳过。
+- 打包脚本改为 `tools/build_package.py`：ZIP 条目名统一用 `/` 并内置安装器规则自检，修复 WebUI 提示「ZIP 包含非法路径、链接或加密文件」。
+- 测试总数 34：21 算法 + 10 Hook 冒烟 + 3 Schema 标签。
+
 ## 1.0.0
 
 首个版本。

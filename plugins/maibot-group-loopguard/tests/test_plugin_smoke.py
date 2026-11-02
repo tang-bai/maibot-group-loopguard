@@ -112,6 +112,8 @@ class PluginHookTest(unittest.IsolatedAsyncioTestCase):
             frequency=self.freq_cap,
         )
         self.plugin._set_context(self.ctx)
+        # 显式注入配置实例：无论用真实 SDK 还是替身，都能直接改字段
+        self.plugin._plugin_config_instance = plugin_module.LoopGuardConfig()
         # 默认配置：把另一只机器人登记进名单
         self.plugin.config.identity.bot_accounts = ["20002"]
         await self.plugin.on_load()
@@ -223,6 +225,7 @@ class NoLoopTest(unittest.IsolatedAsyncioTestCase):
     async def test_state_written_on_unload(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             plugin = plugin_module.create_plugin()
+            plugin._plugin_config_instance = plugin_module.LoopGuardConfig()
             plugin.config.identity.bot_accounts = ["20002"]
             plugin._set_context(
                 SimpleNamespace(

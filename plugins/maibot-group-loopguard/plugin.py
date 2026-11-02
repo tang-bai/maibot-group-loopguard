@@ -74,6 +74,40 @@ _STATE_VERSION = 1
 # ─── 配置模型 ────────────────────────────────────────────────────────
 
 
+def _cfg(
+    label: str,
+    *,
+    default: Any = None,
+    default_factory: Any = None,
+    description: str = "",
+    **extra: Any,
+) -> Any:
+    """声明一个带中文显示名的配置字段。
+
+    WebUI 的配置表单按 Schema 里的 `label` 渲染字段名，缺省时会退回字段名本身
+    （也就是 `window_seconds` 这种蛇形英文）。SDK 的 `Field()` 是 pydantic 的
+    `Field()`，显示名要通过 `json_schema_extra={"label": ...}` 传进去。
+
+    Args:
+        label: WebUI 上显示的中文字段名。
+        default: 默认值（与 `default_factory` 二选一）。
+        default_factory: 默认值工厂，适合 list / dict。
+        description: 悬停说明文本。
+        **extra: 追加到 Schema 的扩展字段，如 `placeholder`、`hint`、`step`。
+
+    Returns:
+        Any: 可直接赋给类属性的 pydantic 字段定义。
+    """
+
+    schema_extra: dict[str, Any] = {"label": label, **extra}
+    field_kwargs: dict[str, Any] = {"description": description, "json_schema_extra": schema_extra}
+    if default_factory is not None:
+        field_kwargs["default_factory"] = default_factory
+    else:
+        field_kwargs["default"] = default
+    return Field(**field_kwargs)
+
+
 class PluginSection(PluginConfigBase):
     """插件总开关。"""
 
@@ -81,9 +115,13 @@ class PluginSection(PluginConfigBase):
     __ui_icon__ = "shield"
     __ui_order__ = 0
 
-    enabled: bool = Field(default=True, description="是否启用复读守卫")
-    config_version: str = Field(default="1.0.0", description="配置版本，勿手动改")
-    dry_run: bool = Field(default=False, description="演习模式：只记日志、照常放行，用于上线前观察误杀")
+    enabled: bool = _cfg("启用复读守卫", default=True, description="总开关；关闭后所有 Hook 直接放行")
+    config_version: str = _cfg("配置版本（勿改）", default="1.0.0", description="Runner 用它判断配置迁移，请保持默认")
+    dry_run: bool = _cfg(
+        "演习模式",
+        default=False,
+        description="只记日志、照常放行；上线前建议先开一天，确认没有误判真人群友",
+    )
 
 
 class IdentitySection(PluginConfigBase):
@@ -93,26 +131,36 @@ class IdentitySection(PluginConfigBase):
     __ui_icon__ = "users"
     __ui_order__ = 1
 
-    bot_accounts: list[str] = Field(
+    bot_accounts: list[str] = _cfg(
+        "已知机器人账号",
         default_factory=list,
-        description="已知机器人的平台账号，建议把同群其它 AI 的 QQ 号都填进来；可写 123456 或 qq:123456",
+        description="同群其它 AI 的账号，填 QQ 号即可（也可写 qq:123456）；这一项最关键",
+        placeholder="例如 123456789",
     )
-    self_accounts: list[str] = Field(
+    self_accounts: list[str] = _cfg(
+        "本实例账号",
         default_factory=list,
-        description="本实例自己的账号；留空时从 bot_config.toml 的 bot.qq_account / bot.platforms 自动读取",
+        description="本实例自己的账号；留空时自动读 bot_config.toml 的 bot.qq_account / bot.platforms",
+        placeholder="留空自动识别",
     )
-    name_patterns: list[str] = Field(
+    name_patterns: list[str] = _cfg(
+        "昵称匹配正则",
         default_factory=lambda: [r"(?i)(bot|机器人|助手|麦麦|maisaka|assistant)$"],
-        description="昵称/群名片正则，命中即按机器人处理；写 .* 等于关闭昵称识别",
+        description="昵称或群名片命中即按机器人处理；填 .* 等于关闭昵称识别",
     )
-    auto_learn_behavior: bool = Field(
+    auto_learn_behavior: bool = _cfg(
+        "行为学习",
         default=True,
-        description="行为学习：未登记账号若在窗口内复述其它机器人的话，自动记为机器人",
+        description="未登记账号若在 30 秒内复述他人内容，自动临时记为机器人（首条只登记、不惩罚）",
     )
-    learned_ttl_seconds: int = Field(default=86400, description="行为学习结果的保留时长（秒），到期自动遗忘")
-    platform_scope: list[str] = Field(
+    learned_ttl_seconds: int = _cfg(
+        "学习结果保留时长（秒）", default=86400, description="行为学习名单的过期时间，到期自动遗忘"
+    )
+    platform_scope: list[str] = _cfg(
+        "生效平台",
         default_factory=lambda: ["qq"],
-        description="生效平台；留空表示所有平台。非名单内平台的任何消息都原样放行",
+        description="只有这些平台的消息进入判定；留空表示全部平台",
+        placeholder="例如 qq",
     )
 
 
@@ -123,22 +171,34 @@ class DetectSection(PluginConfigBase):
     __ui_icon__ = "scan"
     __ui_order__ = 2
 
-    window_seconds: int = Field(default=180, description="滑动窗口长度（秒），窗口外的消息不参与查重")
-    max_records: int = Field(default=60, description="每个聊天流最多保留多少条指纹")
-    min_text_length: int = Field(default=4, description="短于该长度的文本不参与查重，避免把'哈哈'判成复读")
-    simhash_distance: int = Field(
-        default=1, description="SimHash 汉明距离阈值；1 等价于只判定逐字重复，调大会引入噪声，建议不超过 6"
+    window_seconds: int = _cfg("滑动窗口（秒）", default=180, description="窗口外的消息不参与查重")
+    max_records: int = _cfg("每流指纹上限", default=60, description="每个聊天流最多保留多少条消息指纹")
+    min_text_length: int = _cfg(
+        "参与查重的最短长度", default=4, description="短于该长度的文本跳过查重，避免把「哈哈」判成复读"
     )
-    bigram_similarity_threshold: float = Field(default=0.72, description="短文本 2-gram Jaccard 相似度阈值")
-    bigram_containment_threshold: float = Field(
-        default=0.85, description="2-gram 包含度阈值，专门抓'抄一遍再补几个字'的复读"
+    simhash_distance: int = _cfg(
+        "SimHash 距离阈值",
+        default=1,
+        description="1 等价于只判逐字重复；调大会引入噪声，建议不超过 6",
     )
-    max_chain_length: int = Field(default=4, description="自最近一条人类消息起，连续多少条机器人消息后强制静音")
-    duplicate_chain_threshold: int = Field(default=2, description="连续第几条机器人消息起，内容重复就拦")
-    pingpong_span: int = Field(default=6, description="检测'两个机器人互相接话'时回看的消息条数")
-    pingpong_chain_threshold: int = Field(default=3, description="交替节奏成立时的最小连续条数")
-    burst_count: int = Field(default=6, description="爆发检测：窗口内机器人消息达到该条数算爆发")
-    burst_window_seconds: int = Field(default=60, description="爆发检测的时间窗（秒）")
+    bigram_similarity_threshold: float = _cfg(
+        "2-gram 相似度阈值", default=0.72, description="短文本 Jaccard 相似度，抓近义改写", step=0.01
+    )
+    bigram_containment_threshold: float = _cfg(
+        "2-gram 包含度阈值", default=0.85, description="专门抓「抄一遍再补几个字」的复读", step=0.01
+    )
+    max_chain_length: int = _cfg(
+        "连续机器人消息上限", default=4, description="自最近一条人类消息起，连续多少条机器人消息后强制静音"
+    )
+    duplicate_chain_threshold: int = _cfg(
+        "第几条起查重拦截", default=2, description="连续第几条机器人消息起，内容重复就拦"
+    )
+    pingpong_span: int = _cfg("交替检测回看条数", default=6, description="检测两个机器人接话时回看的消息条数")
+    pingpong_chain_threshold: int = _cfg(
+        "交替判定最小条数", default=3, description="交替节奏成立时所需的最小连续机器人消息条数"
+    )
+    burst_count: int = _cfg("爆发判定条数", default=6, description="时间窗内机器人消息达到该条数算爆发")
+    burst_window_seconds: int = _cfg("爆发判定窗口（秒）", default=60, description="爆发检测使用的时间窗")
 
 
 class ActionSection(PluginConfigBase):
@@ -148,26 +208,42 @@ class ActionSection(PluginConfigBase):
     __ui_icon__ = "octagon"
     __ui_order__ = 3
 
-    block_incoming: bool = Field(default=True, description="拦截入站机器人消息（主刹车）")
-    block_self_echo: bool = Field(default=True, description="拦截本实例自己账号的回声消息")
-    block_outgoing: bool = Field(default=True, description="在发送前再查一次重（最后一道闸）")
-    cooldown_base_seconds: int = Field(default=120, description="首次触发后的冷却时长（秒）")
-    cooldown_multiplier: float = Field(default=2.0, description="每次再触发的冷却倍率")
-    cooldown_max_seconds: int = Field(default=1800, description="冷却时长上限（秒）")
-    human_reset_seconds: int = Field(default=300, description="留档：人类发言后多久内视为活跃（当前实现为立即清零链条）")
-    frequency_brake: bool = Field(
-        default=False,
-        description="冷却期内把该聊天流的回复频率倍率压到 brake_value（依赖 frequency.set_adjust 能力）",
+    block_incoming: bool = _cfg(
+        "拦截入站机器人消息", default=True, description="主刹车；关闭后消息照常进主链，但冷却仍在记账"
     )
-    frequency_brake_value: float = Field(default=0.0, description="冷却期内的频率倍率，0 表示完全不出声")
-    frequency_restore_value: float = Field(default=1.0, description="解除冷却时恢复的频率倍率")
-    soft_mute_reply_tool: bool = Field(
-        default=False,
-        description="冷却期内从 Maisaka 规划器的工具定义里摘掉 reply 工具，从源头减少一轮推理",
+    block_self_echo: bool = _cfg("拦截自身回声", default=True, description="丢弃本实例自己账号的回灌消息")
+    block_outgoing: bool = _cfg(
+        "发送前查重", default=True, description="最后一道闸：回复已生成、外发前再查一次重"
     )
-    muted_tool_names: list[str] = Field(default_factory=lambda: ["reply"], description="软静音时要摘掉的工具名")
-    notify_on_trip: bool = Field(default=False, description="触发时在当前群发一条提示（默认关闭，避免自己刷屏）")
-    notify_text: str = Field(default="（复读守卫已介入，暂停接话）", description="提示文案")
+    cooldown_base_seconds: int = _cfg("首轮冷却（秒）", default=120, description="第一次触发后的静音时长")
+    cooldown_multiplier: float = _cfg("冷却倍率", default=2.0, description="每次再触发时冷却时长的放大倍数", step=0.1)
+    cooldown_max_seconds: int = _cfg("冷却上限（秒）", default=1800, description="冷却时长的封顶值")
+    human_reset_seconds: int = _cfg(
+        "人类活跃窗口（秒）", default=300, description="留档字段；当前实现为人类发言立即清零链条与冷却"
+    )
+    frequency_brake: bool = _cfg(
+        "冷却期压低回复频率", default=False, description="调用 frequency.set_adjust 把该流回复频率倍率压下去"
+    )
+    frequency_brake_value: float = _cfg(
+        "冷却期频率倍率", default=0.0, description="0 表示完全不出声", step=0.1
+    )
+    frequency_restore_value: float = _cfg(
+        "解除冷却后频率倍率", default=1.0, description="恢复成正常发言频率", step=0.1
+    )
+    soft_mute_reply_tool: bool = _cfg(
+        "冷却期软静音 reply 工具",
+        default=False,
+        description="从 Maisaka 规划器的工具定义里摘掉 reply，省掉一整轮推理",
+    )
+    muted_tool_names: list[str] = _cfg(
+        "软静音工具名", default_factory=lambda: ["reply"], description="软静音时要从工具定义里移除的名字"
+    )
+    notify_on_trip: bool = _cfg(
+        "触发时群内提示", default=False, description="默认关闭，避免守卫自己刷屏"
+    )
+    notify_text: str = _cfg(
+        "提示文案", default="（复读守卫已介入，暂停接话）", description="打开上一项后发到群里的文字"
+    )
 
 
 class ArbiterSection(PluginConfigBase):
@@ -177,9 +253,15 @@ class ArbiterSection(PluginConfigBase):
     __ui_icon__ = "scale"
     __ui_order__ = 4
 
-    enabled: bool = Field(default=False, description="启用账号优先级仲裁，让同群里多个实例的发言权错开")
-    peers: list[str] = Field(default_factory=list, description="同群其它实例的账号列表，用于计算优先级")
-    self_priority: str = Field(default="", description="本实例对外声明的账号；留空时取自动识别的自身账号")
+    enabled: bool = _cfg(
+        "启用多实例仲裁", default=False, description="按账号字典序决定谁先开口，非主实例提前一步退让"
+    )
+    peers: list[str] = _cfg(
+        "同群其它实例账号", default_factory=list, description="参与优先级排序的账号列表", placeholder="例如 987654321"
+    )
+    self_priority: str = _cfg(
+        "本实例声明账号", default="", description="留空时取自动识别的自身账号", placeholder="留空自动识别"
+    )
 
 
 class CommandSection(PluginConfigBase):
@@ -189,8 +271,11 @@ class CommandSection(PluginConfigBase):
     __ui_icon__ = "terminal"
     __ui_order__ = 5
 
-    command_operators: list[str] = Field(
-        default_factory=list, description="允许使用 /loopguard 的 QQ 号；控制台与 WebUI 始终放行"
+    command_operators: list[str] = _cfg(
+        "命令操作员账号",
+        default_factory=list,
+        description="允许在 QQ 群使用 /loopguard 的账号；控制台与 WebUI 始终放行",
+        placeholder="例如 123456789",
     )
 
 

@@ -6,7 +6,7 @@
 [![MaiBot](https://img.shields.io/badge/MaiBot-1.3.x-8fd6a0)](https://github.com/Mai-with-u/MaiBot)
 [![Plugin SDK](https://img.shields.io/badge/plugin--sdk-%E2%89%A52.0-8fd6a0)](https://docs.maibot.chat/plugin/)
 [![License](https://img.shields.io/badge/license-GPL--3.0--or--later-blue)](./LICENSE)
-[![Tests](https://img.shields.io/badge/tests-31%20passed-brightgreen)](./plugins/maibot-group-loopguard/tests)
+[![Tests](https://img.shields.io/badge/tests-34%20passed-brightgreen)](./plugins/maibot-group-loopguard/tests)
 
 ---
 
@@ -99,6 +99,8 @@ peers = ["另一只机器人的QQ号"]          # 两只都装时，让发言权
 
 完整配置项（6 个 section、40+ 字段）、场景模板与排错表见 [docs/02-使用与部署.md](./docs/02-使用与部署.md)。
 
+> WebUI 配置页的字段名已全部汉化（Schema `label`），`config.toml` 的键名保持英文；改完重载插件并硬刷新页面即可看到。
+
 ---
 
 ## 命令
@@ -118,7 +120,7 @@ peers = ["另一只机器人的QQ号"]          # 两只都装时，让发言权
 
 ```bash
 cd plugins/maibot-group-loopguard
-python -m unittest discover -s tests -v     # 31 个用例：19 算法 + 12 Hook 冒烟
+python -m unittest discover -s tests -v     # 34 个用例：21 算法 + 10 Hook 冒烟 + 3 Schema 标签
 python ../../tools/loop_sim.py             # 双机器人收敛模拟
 ```
 
@@ -137,7 +139,7 @@ python ../../tools/loop_sim.py             # 双机器人收敛模拟
 │   ├── _manifest.json          # Manifest v2（id: maibot-community.group-loop-guard）
 │   ├── plugin.py               # Hook 适配 / 身份识别 / 持久化 / 命令
 │   ├── loopguard_core.py       # 纯标准库算法：规范化、指纹、状态机、仲裁
-│   ├── tests/                  # 31 个用例 + SDK 替身
+│   ├── tests/                  # 34 个用例 + SDK 替身
 │   ├── README.md
 │   └── CHANGELOG.md
 └── tools/

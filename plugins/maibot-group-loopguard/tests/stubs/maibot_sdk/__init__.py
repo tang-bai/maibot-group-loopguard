@@ -12,10 +12,17 @@ from typing import Any, Callable
 from . import types
 
 
-def Field(default: Any = None, *, default_factory: Callable[[], Any] | None = None, description: str = "") -> Any:  # noqa: N802
-    """返回字段默认值；`description` 仅为对齐真实 SDK 的签名。"""
+def Field(
+    default: Any = None,
+    *,
+    default_factory: Callable[[], Any] | None = None,
+    description: str = "",
+    json_schema_extra: dict[str, Any] | None = None,
+    **kwargs: Any,
+) -> Any:  # noqa: N802
+    """返回字段默认值；额外元数据（`description` / `json_schema_extra`）在替身里不参与运行。"""
 
-    del description
+    del description, json_schema_extra, kwargs
     return default_factory() if default_factory is not None else default
 
 

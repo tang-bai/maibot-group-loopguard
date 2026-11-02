@@ -4,6 +4,7 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 .venv/
+.venv-schema/
 venv/
 
 # 插件运行时产物
@@ -12,7 +13,7 @@ data/
 temp/
 *.log
 
-# 构建产物（走 Release 或 tools/build-package.ps1 现打）
+# 构建产物（走 Release 或 tools/build_package.py 现打）
 dist/
 
 # 本地依赖：上游源码快照与 SDK wheel，仅供开发对照
