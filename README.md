@@ -68,8 +68,8 @@ cp -r plugins/maibot-group-loopguard <MaiBot>/plugins/
 # 方式二：用 Release 里的 zip
 unzip maibot-group-loopguard-1.0.0.zip -d <MaiBot>/plugins/
 
-# 方式三：自己打包
-pwsh tools/build-package.ps1            # Windows PowerShell: powershell -File tools/build-package.ps1
+# 方式三：自己打包（ZIP 内路径统一用 /，符合 WebUI 安装校验）
+python tools/build_package.py
 ```
 
 重载插件（WebUI → 插件 → 重载，或重启 `python bot.py`），Runner 日志出现下面这行即成功：
@@ -142,7 +142,7 @@ python ../../tools/loop_sim.py             # 双机器人收敛模拟
 │   └── CHANGELOG.md
 └── tools/
     ├── loop_sim.py             # 双机器人收敛模拟
-    └── build-package.ps1       # 打包成可安装 zip
+    └── build_package.py        # 打包成可安装 zip（自检路径规则）
 ```
 
 ---
@@ -163,6 +163,14 @@ python ../../tools/loop_sim.py             # 双机器人收敛模拟
 - **单边生效**：只装一边也能显著降频（对方连发会持续撞冷却），但两边都装才对称。
 - **名单仍需维护**：行为学习只覆盖"复述他人内容"的场景，内容完全不同的互激靠链条上限。
 - **拦截即不入记忆**：这是有意为之，复读内容进上下文只会让下一轮更像复读。
+
+## 常见问题
+
+**WebUI 装 ZIP 报「ZIP 包含非法路径、链接或加密文件：maibot-group-loopguard\CHANGELOG.md」**
+Windows 的 `Compress-Archive` 会把条目名写成反斜杠（`maibot-group-loopguard\CHANGELOG.md`），而
+MaiBot 的安装器（`src/webui/routers/plugin/zip_install.py:45`）检查 `"\\" in name` 就直接拒绝。
+用 `python tools/build_package.py` 重新打包即可 —— 它用 `zipfile` 写入 `/` 分隔的条目，并在打包后按同一套规则自检。
+已经打好的包也可以先解压、再把目录直接拷进 `<MaiBot>/plugins/`。
 
 ---
 
