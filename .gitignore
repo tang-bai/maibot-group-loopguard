@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# 插件运行时产物
+config.toml
+data/
+temp/
+*.log
+
+# 构建产物（走 Release 或 tools/build-package.ps1 现打）
+dist/
+
+# 本地依赖：上游源码快照与 SDK wheel，仅供开发对照
+MaiBot-src/
+_sdk/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
