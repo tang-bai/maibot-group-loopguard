@@ -1,5 +1,12 @@
 # CHANGELOG
 
+## 1.0.2
+
+- 新增 `/loopguard who`：列出窗口内每个发送者被判成机器人还是人类、各自的消息条数与最后活跃时间，并给出可一键复制的 `learn` 命令。互聊拦不住时先跑这条，九成是对方账号没被识别。
+- 结构性兜底：消息只 @ 已知机器人（含自身账号）时，发送者本身按机器人处理，不再依赖昵称或名单。
+- 文档补充「装完还在互聊」的三步排查路径：先 `who`，再 `learn`，再看 `dry_run` / `enabled` / `platform_scope`。
+- 测试 37 个：22 算法 + 12 Hook 冒烟 + 3 Schema 标签。
+
 ## 1.0.1
 
 - 配置页汉化：39 个字段全部补上中文显示名（`json_schema_extra={"label": ...}`），WebUI 不再显示 `window_seconds`、`bigram_containment_threshold` 这类键名；悬停说明同步精简。

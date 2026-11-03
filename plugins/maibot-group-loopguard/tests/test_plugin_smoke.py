@@ -190,6 +190,33 @@ class PluginHookTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(outgoing, {"action": "abort"})  # 冷却已建立，出站仍然拦
 
+    async def test_who_command_lists_verdicts(self) -> None:
+        await self.plugin.guard_incoming(message=make_message("20002", "机器人说了一句"))
+        await self.plugin.guard_incoming(message=make_message("10086", "人类插嘴"))
+        success, text, _ = await self.plugin.handle_command(
+            is_local_operator=True,
+            user_id="10001",
+            stream_id="stream-1",
+            matched_groups={"sub": "who", "arg": None},
+        )
+        self.assertTrue(success)
+        self.assertIn("20002", text)
+        self.assertIn("机器人", text)
+        self.assertIn("10086", text)
+
+    async def test_unknown_bot_at_known_bot_is_detected(self) -> None:
+        # 未登记的账号只 @ 了已知机器人 → 按机器人处理
+        await self.plugin.guard_incoming(message=make_message("20002", "机器人甲说一句话"))
+        decision = await self.plugin.guard_incoming(
+            message=make_message("99999", "那你觉得呢", at="10001")
+        )
+        # 这是 @ 已知机器人（10001 是自身账号）的消息，发送者被按机器人处理
+        # 第一次放行（chain=1），第二次应该被拦
+        second = await self.plugin.guard_incoming(
+            message=make_message("99999", "那你觉得呢", at="10001")
+        )
+        self.assertEqual(second, {"action": "abort"})
+
     async def test_command_status_reports_state(self) -> None:
         await self.plugin.guard_incoming(message=make_message("20002", "今晚一起打游戏吗我这边随时可以"))
         await self.plugin.guard_incoming(message=make_message("20002", "今晚一起打游戏吗？我这边随时都可以！"))

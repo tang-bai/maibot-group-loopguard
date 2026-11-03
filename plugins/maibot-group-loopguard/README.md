@@ -46,6 +46,7 @@ bot_accounts = ["123456789", "987654321"]
 | 命令 | 说明 |
 | --- | --- |
 | `/loopguard` | 查看当前聊天流的链条长度、退避档位、剩余冷却、拦截计数 |
+| `/loopguard who` | 列出窗口内每个账号被判成机器人还是人类，并给出可复制的 `learn` 命令 |
 | `/loopguard reset [stream_id]` | 重置指定流（留空重置全部） |
 | `/loopguard learn <账号>` | 手动把某个账号记为机器人 |
 | `/loopguard forget <账号>` | 移除行为学习记录 |

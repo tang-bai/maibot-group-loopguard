@@ -377,6 +377,38 @@ class StreamGuard:
         return duration
 
     # ── 主判定 ──────────────────────────────────────────────────
+    def senders(self, now: float) -> list[dict[str, object]]:
+        """列出窗口内出现过的发送者，用于排查"谁被当成了机器人"。
+
+        互聊拦不住时，最常见的根因是对方账号根本没被识别为机器人，
+        于是每条消息都被当成人类、把链条清零。这个方法把窗口内的
+        发送者与各自的判定结果摊开，方便把账号补进名单。
+
+        Args:
+            now: 当前时间戳（秒）。
+
+        Returns:
+            list[dict]: 按最近发言排序的发送者统计。
+        """
+
+        self._prune(now)
+        stats: dict[str, dict[str, object]] = {}
+        for record in self._records:
+            entry = stats.setdefault(
+                record.uid,
+                {
+                    "uid": record.uid,
+                    "count": 0,
+                    "is_bot": False,
+                    "last_ts": record.ts,
+                    "preview": record.preview,
+                },
+            )
+            entry["count"] = int(entry["count"]) + 1
+            entry["is_bot"] = bool(entry["is_bot"]) or record.is_bot
+            entry["last_ts"] = max(float(entry["last_ts"]), record.ts)
+        return sorted(stats.values(), key=lambda item: float(item["last_ts"]), reverse=True)
+
     def looks_like_bot_echo(self, *, now: float, uid: str, text: str) -> bool:
         """判断一条"身份未知"的消息是否在复述刚刚出现过的内容。
 

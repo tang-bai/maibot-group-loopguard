@@ -667,12 +667,16 @@ class LoopGuardPlugin(MaiBotPlugin):
                 self.ctx.logger.debug("行为识别失败已跳过：%s", exc)
 
         # 机器人 @ 另一个已知机器人：这是最典型的互激链路，直接按机器人处理。
+        # 只 @ 已知机器人、没有任何人类参与的消息，发送者本身多半是机器人。
+        # 真人说话通常带上下文或@的是人，不会只对着机器人发号施令。
+        # 仅在名单里有已知机器人时生效，避免把真人@机器人也误判。
         at_targets = _extract_at_targets(message)
         if not is_bot and at_targets:
             known = {_norm_account(item) for item in self.config.identity.bot_accounts if _norm_account(item)}
             known |= set(self._self_accounts.get(str(platform).lower(), set()))
             if at_targets & known:
                 is_bot = True
+                self.ctx.logger.debug("[loopguard] %s(%s) @ 了已知机器人，按机器人消息处理", nickname, user_id)
 
         decision = guard.evaluate(
             now=now,
@@ -838,7 +842,7 @@ class LoopGuardPlugin(MaiBotPlugin):
     @Command(
         "loopguard",
         description="查看/重置复读守卫状态",
-        pattern=r"^/loopguard(?:\s+(?P<sub>status|reset|learn|forget|on|off))?(?:\s+(?P<arg>\S+))?\s*$",
+        pattern=r"^/loopguard(?:\s+(?P<sub>status|who|reset|learn|forget|on|off))?(?:\s+(?P<arg>\S+))?\s*$",
     )
     async def handle_command(self, **kwargs: Any) -> tuple[bool, str, bool]:
         """处理 ``/loopguard`` 命令族。"""
@@ -872,6 +876,31 @@ class LoopGuardPlugin(MaiBotPlugin):
             self._learned.pop(_norm_account(arg), None)
             self._dirty = True
             return True, f"已移除行为学习记录：{_norm_account(arg)}", True
+        if sub == "who":
+            if self._registry is None:
+                return False, "守卫尚未初始化", True
+            target = arg or stream_id
+            if not target:
+                return False, "用法：/loopguard who [stream_id]", True
+            guard = self._registry.get(target, now)
+            senders = guard.senders(now)
+            if not senders:
+                return True, f"流 {target} 的窗口内还没有记录到任何消息", True
+            lines = [
+                f"流 {target} 窗口内的发送者（近 {int(self.config.detect.window_seconds)} 秒）：",
+                f"守卫状态：启用={self.config.plugin.enabled} 演习={self.config.plugin.dry_run} "
+                f"链条={guard.chain_length} 退避={guard.strike} 剩余冷却={guard.cooldown_remaining(now):.0f}s",
+            ]
+            for entry in senders[:8]:
+                verdict = "机器人" if entry["is_bot"] else "当人类处理"
+                age = max(0.0, now - float(entry["last_ts"]))
+                lines.append(f"- {entry['uid']}：{verdict}，{entry['count']} 条，{age:.0f}s 前")
+            not_bot = [str(entry["uid"]) for entry in senders if not entry["is_bot"]]
+            if not_bot:
+                lines.append("以下账号被当成人类：")
+                lines.extend(f"  /loopguard learn {uid}" for uid in not_bot[:4])
+            lines.append("确认是机器人的账号，用 /loopguard learn <账号> 登记，或写进配置的 已知机器人账号 后重载。")
+            return True, "\n".join(lines), True
 
         if self._registry is None:
             return False, "守卫尚未初始化", True

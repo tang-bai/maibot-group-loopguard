@@ -176,6 +176,18 @@ class GuardFlowTest(unittest.TestCase):
         self.assertFalse(decision.allow)
         self.assertEqual(decision.reason, "chain_limit")
 
+    def test_senders_lists_verdicts(self) -> None:
+        guard = self.make_guard()
+        guard.evaluate(now=1.0, uid="bot-a", is_bot=True, text="机器人甲说了一句话")
+        guard.evaluate(now=2.0, uid="human-1", is_bot=False, text="人类插了一句嘴")
+        guard.evaluate(now=3.0, uid="bot-a", is_bot=True, text="机器人甲又说了一句")
+        senders = guard.senders(4.0)
+        self.assertEqual(len(senders), 2)
+        by_uid = {item["uid"]: item for item in senders}
+        self.assertTrue(by_uid["bot-a"]["is_bot"])
+        self.assertFalse(by_uid["human-1"]["is_bot"])
+        self.assertEqual(by_uid["bot-a"]["count"], 2)
+
     def test_arbiter_yields_position(self) -> None:
         params = GuardParams(arbiter_enabled=True, max_chain_length=4)
         primary = StreamGuard(params)
