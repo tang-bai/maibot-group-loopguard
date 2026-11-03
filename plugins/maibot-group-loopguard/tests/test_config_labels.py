@@ -63,7 +63,7 @@ class ConfigLabelTest(unittest.TestCase):
 
     def test_field_count_matches_config_model(self) -> None:
         total = sum(len(section["fields"]) for section in self.schema["sections"].values())
-        self.assertEqual(total, 39, f"字段数量变化了（当前 {total}），记得同步文档里的配置全表")
+        self.assertEqual(total, 47, f"字段数量变化了（当前 {total}），记得同步文档里的配置全表")
 
 
 if __name__ == "__main__":

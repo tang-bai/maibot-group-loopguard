@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "maibot-community.group-loop-guard",
-  "version": "1.0.2",
+  "version": "1.1.0",
   "name": "群聊复读守卫",
   "description": "同群有多个 AI 机器人时，自动识别机器人身份、拦截复读与互相接话，按指数退避冷却避免无限对话",
   "author": {

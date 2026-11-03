@@ -191,6 +191,13 @@ class GuardParams:
     strike_decay_on_human: bool = True
     arbiter_enabled: bool = False
     arbiter_yield_threshold: int = 1
+    # 频率嫌疑：用"响应式发言比例"区分 bot 接话与真人连发，而不是单看发言频率
+    suspect_window_seconds: float = 60.0
+    suspect_min_messages: int = 5
+    suspect_responsive_ratio: float = 0.7
+    suspect_responsive_within_seconds: float = 12.0
+    suspect_strikes_to_mark: int = 3
+    suspect_strike_ttl_seconds: float = 600.0
 
 
 @dataclass(slots=True)
@@ -222,6 +229,23 @@ class Decision:
     learned_bot: bool = False
 
 
+@dataclass(slots=True)
+class FrequencyReport:
+    """一次频率嫌疑评估的结果。
+
+    只统计"发言次数"会把活跃的真人误判成机器人；真正能把两者分开的是
+    **响应式发言比例**：bot 是被触发的，几乎每条都接在别人后面；
+    真人连发则是自己一条接一条，中间没有别人插话。
+    """
+
+    count: int = 0
+    responsive: int = 0
+    ratio: float = 0.0
+    strikes: int = 0
+    suspect: bool = False
+    mark: bool = False
+
+
 class StreamGuard:
     """单个聊天流（群或私聊）的复读状态机。
 
@@ -244,6 +268,8 @@ class StreamGuard:
         self._allowed_bot = 0
         self._last_reason = ""
         self._outgoing: Deque[MessageRecord] = deque(maxlen=10)
+        self._suspect_strikes: Deque[float] = deque(maxlen=8)
+        self._last_suspect_ts = float("-inf")
 
     # ── 状态读取 ────────────────────────────────────────────────
     @property
@@ -377,6 +403,72 @@ class StreamGuard:
         return duration
 
     # ── 主判定 ──────────────────────────────────────────────────
+    def check_frequency(self, *, now: float, uid: str, record: bool = True) -> FrequencyReport:
+        """评估某个账号是否呈现出"被触发型 bot"的发言模式。
+
+        判定分两步，缺一不可：
+        1. 窗口内发言次数达到阈值，**且响应式发言占比达标**；
+        2. 上述高频窗口累计出现 N 次（同一波只记一次，过期自动作废）。
+
+        举例：真人群友连发 6 句"哈哈/笑死/真的吗"，响应式占比接近 0，直接排除；
+        两只 bot 互聊时 A-B-A-B 每条都接在别人后面，占比接近 100%。
+
+        Args:
+            now: 当前时间戳（秒）。
+            uid: 待评估的账号。
+            record: 是否把本次评估写进嫌疑计数。`/loopguard who` 这类
+                查询命令应传 False，否则看一眼状态就会把人标记成 bot。
+
+        Returns:
+            FrequencyReport: `mark=True` 时调用方应把该账号标记为机器人。
+        """
+
+        self._prune(now)
+        params = self.params
+        window = max(10.0, params.suspect_window_seconds)
+        horizon = now - window
+        messages = sorted(
+            (record for record in self._records if record.uid == str(uid or "") and record.ts >= horizon),
+            key=lambda record: record.ts,
+        )
+        report = FrequencyReport(count=len(messages))
+
+        if report.count < max(2, params.suspect_min_messages):
+            return report
+
+        within = max(1.0, params.suspect_responsive_within_seconds)
+        for message in messages:
+            # 向前找最近的"别人"的发言：紧跟在别人后面才算响应式
+            previous = next(
+                (
+                    other
+                    for other in reversed(self._records)
+                    if other.ts <= message.ts and other.uid != message.uid
+                ),
+                None,
+            )
+            if previous is not None and message.ts - previous.ts <= within:
+                report.responsive += 1
+
+        report.ratio = report.responsive / report.count if report.count else 0.0
+        if report.ratio < params.suspect_responsive_ratio:
+            return report
+
+        report.suspect = True
+        # 同一波高频只记一次；首次评估时 _last_suspect_ts 为 -inf，不会被挡
+        report.strikes = len(self._suspect_strikes)
+        if not record or (now - self._last_suspect_ts) < window:
+            return report
+
+        self._last_suspect_ts = now
+        self._suspect_strikes.append(now)
+        ttl = max(window, params.suspect_strike_ttl_seconds)
+        while self._suspect_strikes and now - self._suspect_strikes[0] > ttl:
+            self._suspect_strikes.popleft()
+        report.strikes = len(self._suspect_strikes)
+        report.mark = report.strikes >= max(1, params.suspect_strikes_to_mark)
+        return report
+
     def senders(self, now: float) -> list[dict[str, object]]:
         """列出窗口内出现过的发送者，用于排查"谁被当成了机器人"。
 

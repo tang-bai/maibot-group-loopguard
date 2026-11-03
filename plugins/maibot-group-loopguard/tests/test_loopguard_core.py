@@ -202,6 +202,71 @@ class GuardFlowTest(unittest.TestCase):
         self.assertGreaterEqual(secondary.suppressed, primary.suppressed)
 
 
+class FrequencySuspectTest(unittest.TestCase):
+    """频率嫌疑：高频 + 响应式发言，而不是单纯的发言频率。"""
+
+    def make_guard(self, **overrides: object) -> StreamGuard:
+        params = GuardParams()
+        for key, value in overrides.items():
+            setattr(params, key, value)
+        return StreamGuard(params)
+
+    def test_human_burst_is_not_suspect(self) -> None:
+        # 真人连发 6 句短句，中间没有别人插话：响应式占比接近 0
+        guard = self.make_guard()
+        for index in range(6):
+            guard.evaluate(now=float(index + 1), uid="human", is_bot=False, text="哈哈")
+        report = guard.check_frequency(now=7.0, uid="human")
+        self.assertEqual(report.count, 6)
+        self.assertLess(report.ratio, 0.7)
+        self.assertFalse(report.mark)
+
+    def test_bot_pingpong_gets_marked_after_three_windows(self) -> None:
+        guard = self.make_guard(suspect_min_messages=3, suspect_strikes_to_mark=3)
+        marked_at: list[float] = []
+        for window in range(3):
+            base = float(window * 90)
+            for turn in range(3):
+                ts = base + turn * 2
+                guard.evaluate(now=ts, uid="other", is_bot=False, text=f"别人说的第 {turn} 句")
+                guard.evaluate(now=ts + 1, uid="candidate", is_bot=False, text=f"接话第 {turn} 句")
+            report = guard.check_frequency(now=base + 8, uid="candidate")
+            if report.mark:
+                marked_at.append(base)
+        self.assertEqual(len(marked_at), 1, f"应恰好标记一次，实际 {marked_at}")
+
+    def test_one_burst_only_counts_once(self) -> None:
+        guard = self.make_guard(suspect_min_messages=3)
+        for turn in range(3):
+            ts = float(turn * 2)
+            guard.evaluate(now=ts, uid="other", is_bot=False, text=f"别人 {turn}")
+            guard.evaluate(now=ts + 1, uid="candidate", is_bot=False, text=f"接话 {turn}")
+        first = guard.check_frequency(now=8.0, uid="candidate")
+        second = guard.check_frequency(now=9.0, uid="candidate")
+        self.assertEqual(first.strikes, 1)
+        self.assertEqual(second.strikes, 1, "同一波高频不应重复记嫌疑")
+
+    def test_low_volume_is_ignored(self) -> None:
+        guard = self.make_guard()
+        guard.evaluate(now=1.0, uid="other", is_bot=False, text="别人说话")
+        guard.evaluate(now=2.0, uid="candidate", is_bot=False, text="接一句")
+        report = guard.check_frequency(now=3.0, uid="candidate")
+        self.assertEqual(report.count, 1)
+        self.assertFalse(report.suspect)
+
+    def test_record_false_does_not_accumulate(self) -> None:
+        guard = self.make_guard(suspect_min_messages=3)
+        for turn in range(3):
+            ts = float(turn * 2)
+            guard.evaluate(now=ts, uid="other", is_bot=False, text=f"别人 {turn}")
+            guard.evaluate(now=ts + 1, uid="candidate", is_bot=False, text=f"接话 {turn}")
+        before = len(guard._suspect_strikes)
+        peek = guard.check_frequency(now=8.0, uid="candidate", record=False)
+        self.assertEqual(len(guard._suspect_strikes), before, "只读查询不应写入嫌疑计数")
+        self.assertTrue(peek.suspect)
+        self.assertFalse(peek.mark)
+
+
 class RegistryTest(unittest.TestCase):
     """多流管理与快照。"""
 

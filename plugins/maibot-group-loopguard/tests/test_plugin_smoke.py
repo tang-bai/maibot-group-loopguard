@@ -17,6 +17,7 @@ import logging
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -216,6 +217,33 @@ class PluginHookTest(unittest.IsolatedAsyncioTestCase):
             message=make_message("99999", "那你觉得呢", at="10001")
         )
         self.assertEqual(second, {"action": "abort"})
+
+    async def test_frequency_suspect_marks_bot_after_three_bursts(self) -> None:
+        self.plugin.config.suspect.enabled = True
+        self.plugin.config.suspect.min_messages = 3
+        self.plugin.config.suspect.strikes_to_mark = 3
+        self.plugin._registry = plugin_module.GuardRegistry(self.plugin._build_params())
+
+        async def run_burst(base: float) -> None:
+            for turn in range(3):
+                ts = base + turn * 2
+                with unittest.mock.patch.object(plugin_module.time, "time", return_value=ts):
+                    await self.plugin.guard_incoming(message=make_message("30003", f"别人第 {turn} 句"))
+                with unittest.mock.patch.object(plugin_module.time, "time", return_value=ts + 1):
+                    await self.plugin.guard_incoming(message=make_message("40004", f"接话第 {turn} 句"))
+
+        for window in range(3):
+            await run_burst(float(window * 90))
+
+        self.assertIn("40004", self.plugin._learned, "三次高频响应窗口后应被标记为 bot")
+        self.assertNotIn("30003", self.plugin._learned, "只发一条的另一方不应被标记")
+
+    async def test_frequency_suspect_disabled_by_default(self) -> None:
+        self.assertFalse(self.plugin.config.suspect.enabled)
+        for turn in range(6):
+            await self.plugin.guard_incoming(message=make_message("30003", f"别人第 {turn} 句"))
+            await self.plugin.guard_incoming(message=make_message("40004", f"接话第 {turn} 句"))
+        self.assertEqual(self.plugin._learned, {}, "默认关闭时不应产生任何标记")
 
     async def test_command_status_reports_state(self) -> None:
         await self.plugin.guard_incoming(message=make_message("20002", "今晚一起打游戏吗我这边随时可以"))

@@ -279,6 +279,36 @@ class CommandSection(PluginConfigBase):
     )
 
 
+class SuspectSection(PluginConfigBase):
+    """频率嫌疑识别（默认关闭，先开演习观察再启用）。"""
+
+    __ui_label__ = "频率嫌疑"
+    __ui_icon__ = "activity"
+    __ui_order__ = 6
+
+    enabled: bool = _cfg(
+        "启用频率嫌疑识别",
+        default=False,
+        description="按「高频 + 紧跟别人发言」识别未登记的 bot。误判会把真人当 bot，建议先开演习模式观察",
+    )
+    window_seconds: int = _cfg("统计窗口（秒）", default=60, description="评估单个账号发言模式的时间窗")
+    min_messages: int = _cfg("窗口内发言次数阈值", default=5, description="达到该条数才进入嫌疑评估")
+    responsive_ratio: float = _cfg(
+        "响应式发言占比",
+        default=0.7,
+        description="紧跟在别人发言后的比例下限；真人连发该比例很低，bot 接话接近 100%",
+        step=0.05,
+    )
+    responsive_within_seconds: int = _cfg(
+        "响应间隔（秒）", default=12, description="距上一条他人消息多久以内算「接话」"
+    )
+    strikes_to_mark: int = _cfg("嫌疑次数上限", default=3, description="出现多少次高频响应窗口后标记为 bot")
+    strike_ttl_seconds: int = _cfg("嫌疑记录有效期（秒）", default=600, description="同一波高频只记一次，过期自动作废")
+    mark_ttl_seconds: int = _cfg(
+        "标记保留时长（秒）", default=1800, description="被标为 bot 后的保留时长，比行为学习短，便于误伤自愈"
+    )
+
+
 class LoopGuardConfig(PluginConfigBase):
     """复读守卫总配置。"""
 
@@ -288,6 +318,7 @@ class LoopGuardConfig(PluginConfigBase):
     action: ActionSection = Field(default_factory=ActionSection)
     arbiter: ArbiterSection = Field(default_factory=ArbiterSection)
     command: CommandSection = Field(default_factory=CommandSection)
+    suspect: SuspectSection = Field(default_factory=SuspectSection)
 
 
 # ─── 消息解析工具 ────────────────────────────────────────────────────
@@ -450,6 +481,12 @@ class LoopGuardPlugin(MaiBotPlugin):
             human_reset_seconds=float(action.human_reset_seconds),
             arbiter_enabled=bool(arbiter.enabled),
             arbiter_yield_threshold=1,
+            suspect_window_seconds=float(self.config.suspect.window_seconds),
+            suspect_min_messages=int(self.config.suspect.min_messages),
+            suspect_responsive_ratio=float(self.config.suspect.responsive_ratio),
+            suspect_responsive_within_seconds=float(self.config.suspect.responsive_within_seconds),
+            suspect_strikes_to_mark=int(self.config.suspect.strikes_to_mark),
+            suspect_strike_ttl_seconds=float(self.config.suspect.strike_ttl_seconds),
         )
 
     # ── 身份识别 ────────────────────────────────────────────────
@@ -522,14 +559,47 @@ class LoopGuardPlugin(MaiBotPlugin):
             return False
         return True
 
-    def _remember_learned(self, user_id: str, now: float) -> None:
+    def _remember_learned(self, user_id: str, now: float, ttl_seconds: int = 0) -> None:
         """把一个账号写入行为学习名单。"""
 
         if not user_id:
             return
-        ttl = max(60, int(self.config.identity.learned_ttl_seconds))
+        ttl = max(60, int(ttl_seconds or self.config.identity.learned_ttl_seconds))
         self._learned[user_id] = now + ttl
         self._dirty = True
+
+    def _check_frequency_suspect(self, guard: Any, stream_id: str, user_id: str, nickname: str, now: float) -> None:
+        """频率嫌疑：高频 + 紧跟别人发言，累计 N 次后把账号标为 bot。
+
+        只在 `suspect.enabled = true` 时生效。标记本身不拦截本条消息，
+        下一条起该账号就按机器人规则走，与显式名单效果一致。
+        """
+
+        if not self.config.suspect.enabled or not user_id:
+            return
+        try:
+            report = guard.check_frequency(now=now, uid=user_id)
+            if not report.suspect:
+                return
+            self.ctx.logger.info(
+                "[loopguard] 频率嫌疑 stream=%s sender=%s 窗口内 %d 条（接话 %.0f%%）嫌疑 %d/%d",
+                stream_id,
+                user_id,
+                report.count,
+                report.ratio * 100,
+                report.strikes,
+                self.config.suspect.strikes_to_mark,
+            )
+            if report.mark:
+                self._remember_learned(user_id, now, ttl_seconds=int(self.config.suspect.mark_ttl_seconds))
+                self.ctx.logger.warning(
+                    "[loopguard] %s(%s) 呈现被触发型 bot 发言模式，已标记为机器人（%d 秒后失效）",
+                    nickname or user_id,
+                    user_id,
+                    self.config.suspect.mark_ttl_seconds,
+                )
+        except Exception as exc:
+            self.ctx.logger.debug("频率嫌疑评估失败已跳过：%s", exc)
 
     def _is_bot_account(self, platform: str, user_id: str, nickname: str, cardname: str, now: float) -> bool:
         """按"名单 → 行为学习 → 昵称正则"的顺序判定发送者是不是机器人。"""
@@ -686,6 +756,10 @@ class LoopGuardPlugin(MaiBotPlugin):
             is_self=is_self and self.config.action.block_self_echo,
             is_arbiter_primary=self._arbiter_primary(),
         )
+
+        # 本条已计入窗口，此刻评估发言模式最完整；仅登记身份，不额外惩罚本条
+        if not is_bot:
+            self._check_frequency_suspect(guard, stream_id, user_id, nickname, now)
 
         if decision.allow:
             if is_bot:
@@ -895,6 +969,13 @@ class LoopGuardPlugin(MaiBotPlugin):
                 verdict = "机器人" if entry["is_bot"] else "当人类处理"
                 age = max(0.0, now - float(entry["last_ts"]))
                 lines.append(f"- {entry['uid']}：{verdict}，{entry['count']} 条，{age:.0f}s 前")
+                if not entry["is_bot"] and self.config.suspect.enabled:
+                    report = guard.check_frequency(now=now, uid=str(entry["uid"]), record=False)
+                    if report.count >= 2:
+                        lines.append(
+                            f"    发言模式：{report.count} 条 / 接话 {report.ratio * 100:.0f}%"
+                            f" / 嫌疑 {report.strikes}/{self.config.suspect.strikes_to_mark}"
+                        )
             not_bot = [str(entry["uid"]) for entry in senders if not entry["is_bot"]]
             if not_bot:
                 lines.append("以下账号被当成人类：")
