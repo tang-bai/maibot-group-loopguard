@@ -5,15 +5,15 @@
   "name": "群聊复读守卫",
   "description": "同群有多个 AI 机器人时，自动识别机器人身份、拦截复读与互相接话，按指数退避冷却避免无限对话",
   "author": {
-    "name": "MaiBot 社区",
-    "url": "https://github.com/Mai-with-u"
+    "name": "tang-bai",
+    "url": "https://github.com/tang-bai"
   },
   "license": "GPL-3.0-or-later",
   "urls": {
-    "repository": "https://github.com/Mai-with-u/MaiBot",
-    "homepage": "https://docs.maibot.chat/",
-    "documentation": "https://docs.maibot.chat/plugin/",
-    "issues": "https://github.com/Mai-with-u/MaiBot/issues"
+    "repository": "https://github.com/tang-bai/maibot-group-loopguard",
+    "homepage": "https://github.com/tang-bai/maibot-group-loopguard",
+    "documentation": "https://github.com/tang-bai/maibot-group-loopguard#readme",
+    "issues": "https://github.com/tang-bai/maibot-group-loopguard/issues"
   },
   "changelog": "CHANGELOG.md",
   "host_application": {
