@@ -6,7 +6,7 @@
 [![MaiBot](https://img.shields.io/badge/MaiBot-1.3.x-8fd6a0)](https://github.com/Mai-with-u/MaiBot)
 [![Plugin SDK](https://img.shields.io/badge/plugin--sdk-%E2%89%A52.0-8fd6a0)](https://docs.maibot.chat/plugin/)
 [![License](https://img.shields.io/badge/license-GPL--3.0--or--later-blue)](./LICENSE)
-[![Tests](https://img.shields.io/badge/tests-84%20cases-brightgreen)](./plugins/maibot-group-loopguard/tests)
+[![Tests](https://img.shields.io/badge/tests-98%20cases-brightgreen)](./plugins/maibot-group-loopguard/tests)
 
 ---
 
@@ -29,7 +29,7 @@ Bot-B：那我也来，几点开始？？
 | 位置 | Hook | 效果 |
 | --- | --- | --- |
 | 入站 | `chat.receive.before_process` | 判定命中即 `abort`：**不入库、不进上下文、不触发推理** |
-| 出站 | `send_service.before_send` | 回复已生成也拦得住：冷却期或内容重复就取消发送 |
+| 出站 | `send_service.before_send` | 回复已生成也拦得住：冷却、重复或单群出站熔断时取消发送 |
 | 规划 | `maisaka.planner.before_request` | 可选软静音：冷却期摘掉 `reply` 工具，省掉一整轮推理 |
 
 ---
@@ -37,12 +37,13 @@ Bot-B：那我也来，几点开始？？
 ## 判定逻辑
 
 ```
-身份层   自身账号 → 真人白名单 → 机器人名单 → 当前群临时学习
+身份层   自身账号 → 真人白名单 → 机器人名单/共享名册 → 协作签名/适配器扩展 → 当前群临时学习
          多轮回声 + 不同来源内容 + bot响应锚点；昵称默认仅提示，@不定性
 内容层   BLAKE2b digest（逐字）· SimHash（逐字快筛）
          2-gram Jaccard ≥ 0.72 · 2-gram 包含度 ≥ 0.85（抄一遍再补几个字）
 节奏层   连续机器人消息 ≥ 4 · 双账号交替接话 · 60s 内 ≥ 6 条爆发
-退避层   120s × 2ⁿ，上限 1800s；人类发言立即清零
+退避层   120s × 2ⁿ，上限 1800s；未知身份消息不清空独立出站预算
+兜底层   无论发送者身份：单群60秒内最多发6条，第7条进入120秒静默；明确真人白名单可清零
 ```
 
 设计原则是**第一次允许**：对面机器人说了一句正常的新内容，本实例照常回应一轮；只有进入"重复 / 交替 / 超长链条"才动手。
@@ -67,7 +68,7 @@ Bot-B：那我也来，几点开始？？
 cp -r plugins/maibot-group-loopguard <MaiBot>/plugins/
 
 # 方式二：用 Release 里的 zip
-unzip maibot-group-loopguard-1.2.0.zip -d <MaiBot>/plugins/
+unzip maibot-group-loopguard-1.3.0.zip -d <MaiBot>/plugins/
 
 # 方式三：自己打包（ZIP 内路径统一用 /，符合 WebUI 安装校验）
 python tools/build_package.py
@@ -101,11 +102,17 @@ enabled = true
 peers = ["另一只机器人的QQ号"]          # 两只都装时，让发言权按账号字典序错开
 ```
 
-完整配置项（7 个 section、53 个字段）、场景模板与排错表见 [docs/02-使用与部署.md](./docs/02-使用与部署.md)。
+完整配置项（7 个 section、61 个字段）、场景模板与排错表见 [docs/02-使用与部署.md](./docs/02-使用与部署.md)。
 
 > WebUI 配置页的字段名已全部汉化（Schema `label`），`config.toml` 的键名保持英文；改完重载插件并硬刷新页面即可看到。
 
 ---
+
+## v1.3 新增：合作识别与无身份兜底
+
+- **无须先识别bot**：默认每个聊天流60秒最多放行6条出站，第7条静默120秒；未知账号发言不能清空预算，真人白名单可清零。跨群独立、重启保留窗口计数与剩余冷却。
+- **多个受控bot**：可选从宿主指定配置键同步平台:账号名册；共享密钥后还可选择给外发正文加可见的HMAC尾标，入站绑定账号/群/时间/正文验证；默认关闭外发签名。
+- **适配器扩展**：`sender.bot`不是OneBot v11标准字段，默认不信任；仅确认你的适配器提供时再开启。详细配置见[部署说明](./docs/02-使用与部署.md)。
 
 ## 命令
 
@@ -125,7 +132,7 @@ peers = ["另一只机器人的QQ号"]          # 两只都装时，让发言权
 
 ```bash
 cd plugins/maibot-group-loopguard
-python -m unittest discover -s tests -v     # 84 项；无真实SDK时81通过、3项Schema跳过
+python -m unittest discover -s tests -v     # 98 项；无真实SDK时95通过、3项Schema跳过
 python ../../tools/loop_sim.py             # 双机器人收敛模拟
 ```
 
@@ -144,7 +151,7 @@ python ../../tools/loop_sim.py             # 双机器人收敛模拟
 │   ├── _manifest.json          # Manifest v2（id: maibot-community.group-loop-guard）
 │   ├── plugin.py               # Hook 适配 / 身份识别 / 持久化 / 命令
 │   ├── loopguard_core.py       # 纯标准库算法：规范化、指纹、状态机、仲裁
-│   ├── tests/                  # 84 项用例 + SDK 替身
+│   ├── tests/                  # 98 项用例 + SDK 替身
 │   ├── README.md
 │   └── CHANGELOG.md
 └── tools/
@@ -169,7 +176,7 @@ python ../../tools/loop_sim.py             # 双机器人收敛模拟
 - **语义级改写**不靠指纹抓，靠链条长度与交替节奏兜底；`max_chain_length` 是最终保险。
 - **单边生效**：只装一边也能显著降频（对方连发会持续撞冷却），但两边都装才对称。
 - **身份是启发式判断**：聊天文本本身不能证明真实身份。默认先观察未知账号；单次复制、@、昵称都不直接判bot。
-- **不复读的未知bot**：可开启可选的频率嫌疑（须多窗口响应已知bot）；显式 bot_accounts 仍最可靠。链条上限只对已识别bot生效。
+- **不复读的未知bot**：已知bot显式填 bot_accounts 最可靠；未知身份仍受独立出站熔断约束，避免无限自动回复。可选频率嫌疑须多窗口响应已知bot，链条上限只对已识别bot生效。
 - **升级**：v1旧学习名单和冷却自动清理，手工临时learn也需重新登记；配置中的bot_accounts保留。
 - **拦截即不入记忆**：这是有意为之，复读内容进上下文只会让下一轮更像复读。
 

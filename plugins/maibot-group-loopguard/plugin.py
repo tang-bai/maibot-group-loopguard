@@ -25,6 +25,8 @@ A 的回复触发 B 的回复，B 的回复又触发 A，几轮之后两边开�
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
 import math
 import re
@@ -70,6 +72,7 @@ hamming_distance = _CORE.hamming_distance
 
 _STATE_FILE = "loopguard_state.json"
 _STATE_VERSION = 2
+_BOT_MARKER_RE = re.compile(r"(?:^|\s)\[LG1:(\d{10}):([0-9a-f]{32})\]$")
 
 
 # ─── 配置模型 ────────────────────────────────────────────────────────
@@ -117,7 +120,7 @@ class PluginSection(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = _cfg("启用复读守卫", default=True, description="总开关；关闭后所有 Hook 直接放行")
-    config_version: str = _cfg("配置版本（勿改）", default="1.2.0", description="Runner 用它判断配置迁移，请保持默认")
+    config_version: str = _cfg("配置版本（勿改）", default="1.3.0", description="Runner 用它判断配置迁移，请保持默认")
     dry_run: bool = _cfg(
         "演习模式",
         default=False,
@@ -179,6 +182,22 @@ class IdentitySection(PluginConfigBase):
     learned_ttl_seconds: int = _cfg(
         "学习结果保留时长（秒）", default=1800, description="自动学习的过期时间；默认30分钟，到期重新观察"
     )
+    peer_bot_config_key: str = _cfg(
+        "共享机器人名册配置键", default="",
+        description="可选，读取宿主全局配置中的平台:账号列表作为bot名册；重载配置时刷新，留空不读取",
+    )
+    trust_protocol_bot_flag: bool = _cfg(
+        "信任适配器bot标志", default=False,
+        description="仅对可信协议适配器开启；OneBot v11标准不保证 sender.bot 字段",
+    )
+    cooperative_secret: str = _cfg(
+        "协作bot共享密钥", default="",
+        description="可选。用HMAC验证LG1消息尾标；仅在受控bot之间共享，空值关闭",
+    )
+    sign_outgoing: bool = _cfg(
+        "外发添加协作签名", default=False,
+        description="需配置共享密钥；发送前在正文后添加可见的LG1标记，用于受控bot跨框架互认",
+    )
     platform_scope: list[str] = _cfg(
         "生效平台",
         default_factory=lambda: ["qq"],
@@ -237,6 +256,19 @@ class ActionSection(PluginConfigBase):
     block_self_echo: bool = _cfg("拦截自身回声", default=True, description="丢弃本实例自己账号的回灌消息")
     block_outgoing: bool = _cfg(
         "发送前查重", default=True, description="最后一道闸：回复已生成、外发前再查一次重"
+    )
+    outgoing_fuse_enabled: bool = _cfg(
+        "独立出站熔断", default=True,
+        description="无论是否识别发送者，单群短时间外发超过上限都会暂停；默认第7条触发",
+    )
+    outgoing_fuse_max_count: int = _cfg(
+        "出站窗口最多条数", default=6, description="达到该条数后下一条触发熔断；仅明确真人白名单可清空计数",
+    )
+    outgoing_fuse_window_seconds: int = _cfg(
+        "出站窗口秒数", default=60, description="仅统计窗口内本实例外发的消息",
+    )
+    outgoing_fuse_cooldown_seconds: int = _cfg(
+        "出站熔断静默秒数", default=120, description="熔断后暂停外发，未知账号发言不会解除",
     )
     cooldown_base_seconds: int = _cfg("首轮冷却（秒）", default=120, description="第一次触发后的静音时长")
     cooldown_multiplier: float = _cfg("冷却倍率", default=2.0, description="每次再触发时冷却时长的放大倍数", step=0.1)
@@ -376,6 +408,64 @@ def _extract_text(message: dict[str, Any]) -> str:
     return "".join(parts)
 
 
+def _signature_scope(message: dict[str, Any], stream_id: str) -> str:
+    """跨框架优先按平台群号签名；宿主session_id只作无群号时回退。"""
+
+    info = message.get("message_info")
+    group = info.get("group_info") if isinstance(info, dict) else None
+    if isinstance(group, dict) and group.get("group_id"):
+        return "group:" + str(group["group_id"])
+    return stream_id
+
+
+def _marker_payload(platform: str, stream_id: str, uid: str, ts: int, text: str) -> bytes:
+    """签名绑定平台、群、实际发送者、时间与正文。"""
+
+    value = [str(platform).lower(), str(stream_id), str(uid), ts, str(text).strip()]
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def make_bot_marker(text: str, secret: str, platform: str, stream_id: str, uid: str, now: float) -> str:
+    """生成协作机器人HMAC尾标。"""
+
+    if not secret or not uid or uid == "self" or not normalize_text(text):
+        raise ValueError("需要共享密钥、真实发送账号和非空正文")
+    ts = int(now)
+    digest = hmac.new(secret.encode("utf-8"), _marker_payload(platform, stream_id, uid, ts, text), hashlib.sha256)
+    return f"[LG1:{ts}:{digest.hexdigest()[:32]}]"
+
+
+def verify_bot_marker(text: str, secret: str, platform: str, stream_id: str, uid: str, now: float) -> bool:
+    """只验证含账号、聊天流和时间约束的HMAC。"""
+
+    if not secret or not uid:
+        return False
+    match = _BOT_MARKER_RE.search(text)
+    if match is None:
+        return False
+    timestamp = int(match.group(1))
+    if abs(now - timestamp) > 300:
+        return False
+    body = text[:match.start()].strip()
+    if not normalize_text(body):
+        return False
+    expected = make_bot_marker(body, secret, platform, stream_id, uid, timestamp)
+    return hmac.compare_digest(match.group(0).strip(), expected)
+
+
+def _append_bot_marker(message: dict[str, Any], marker: str) -> dict[str, Any] | None:
+    """复制Hook载荷后追加纯文本组件。"""
+
+    raw = message.get("raw_message")
+    if not isinstance(raw, list) or not any(isinstance(c, dict) and c.get("type") == "text" for c in raw):
+        return None
+    updated = dict(message)
+    updated["raw_message"] = [*raw, {"type": "text", "data": " " + marker}]
+    if isinstance(message.get("processed_plain_text"), str):
+        updated["processed_plain_text"] = message["processed_plain_text"] + " " + marker
+    return updated
+
+
 def _stream_id(message: dict[str, Any], fallback: str = "") -> str:
     """使用稳定会话键，避免每条 message_id 生成独立状态。"""
 
@@ -447,6 +537,7 @@ class LoopGuardPlugin(MaiBotPlugin):
         super().__init__()
         self._registry: Any = None
         self._self_accounts: dict[str, set[str]] = {}
+        self._peer_roster: list[str] = []
         self._learned: dict[str, float] = {}
         self._learned_sources: dict[str, str] = {}
         self._braked: set[str] = set()
@@ -465,6 +556,7 @@ class LoopGuardPlugin(MaiBotPlugin):
         self._state_path = Path(self.ctx.paths.data_dir) / _STATE_FILE
         self._state_path.parent.mkdir(parents=True, exist_ok=True)
         await self._resolve_self_accounts()
+        await self._resolve_peer_roster()
         self._load_state()
         self._save_task = asyncio.create_task(self._save_loop())
         self.ctx.logger.info(
@@ -491,8 +583,12 @@ class LoopGuardPlugin(MaiBotPlugin):
         """配置热重载：重建阈值、重新识别自身账号。"""
 
         self.ctx.logger.info("复读守卫配置更新：scope=%s version=%s", scope, version)
+        now = time.time()
+        previous = self._registry.snapshot(now) if self._registry is not None else {}
         self._registry = GuardRegistry(self._build_params(), max_streams=200)
+        self._registry.restore(previous, now)
         await self._resolve_self_accounts()
+        await self._resolve_peer_roster()
         self._dirty = True
 
     # ── 配置映射 ────────────────────────────────────────────────
@@ -532,6 +628,10 @@ class LoopGuardPlugin(MaiBotPlugin):
             identity_window_seconds=float(self.config.identity.behavior_window_seconds),
             identity_min_text_length=int(self.config.identity.behavior_min_text_length),
             identity_response_within_seconds=float(self.config.identity.behavior_response_within_seconds),
+            outgoing_fuse_enabled=bool(action.outgoing_fuse_enabled),
+            outgoing_fuse_max_count=int(action.outgoing_fuse_max_count),
+            outgoing_fuse_window_seconds=float(action.outgoing_fuse_window_seconds),
+            outgoing_fuse_cooldown_seconds=float(action.outgoing_fuse_cooldown_seconds),
         )
 
     # ── 身份识别 ────────────────────────────────────────────────
@@ -568,6 +668,21 @@ class LoopGuardPlugin(MaiBotPlugin):
                 _add(platform, account)
 
         self._self_accounts = accounts
+
+    async def _resolve_peer_roster(self) -> None:
+        """从宿主配置键同步明确登记的机器人名册，而非猜测 bot.platforms 自身账号。"""
+
+        key = str(self.config.identity.peer_bot_config_key or "").strip()
+        if not key:
+            self._peer_roster = []
+            return
+        try:
+            entries = await self.ctx.config.get(key, [])
+            if not isinstance(entries, list) or not all(isinstance(item, str) for item in entries):
+                raise ValueError("共享机器人名册必须是字符串列表")
+            self._peer_roster = entries
+        except Exception as exc:
+            self.ctx.logger.warning("同步机器人名册失败（保留上次名册）：%s", exc)
 
     def _is_self(self, platform: str, user_id: str) -> bool:
         """判断账号是否属于本实例。"""
@@ -641,13 +756,22 @@ class LoopGuardPlugin(MaiBotPlugin):
         return False
 
     def _identity_source(self, platform: str, stream_id: str, user_id: str,
-                         nickname: str, cardname: str, now: float) -> tuple[bool, str]:
+                         nickname: str, cardname: str, now: float, *, signed: bool = False,
+                         protocol_bot: bool = False) -> tuple[bool, str]:
         if self._is_self(platform, user_id):
             return True, "本实例账号"
         if self._account_in(self.config.identity.human_accounts, platform, user_id):
             return False, "真人白名单"
         if self._account_in(self.config.identity.bot_accounts, platform, user_id):
             return True, "机器人名单"
+        if self._account_in(self._peer_roster, platform, user_id):
+            return True, "共享机器人名册"
+        if self.config.arbiter.enabled and self._account_in(self.config.arbiter.peers, platform, user_id):
+            return True, "多实例仲裁名单"
+        if signed:
+            return True, "协作签名已验证"
+        if protocol_bot and self.config.identity.trust_protocol_bot_flag:
+            return True, "适配器bot扩展标志"
         key = self._learned_key(platform, stream_id, user_id, now)
         if key:
             return True, "临时学习：" + self._learned_sources.get(key, "manual")
@@ -784,7 +908,15 @@ class LoopGuardPlugin(MaiBotPlugin):
         guard = self._registry.get(stream_id, now, platform=platform)
 
         is_self = self._is_self(platform, user_id)
-        is_bot, identity_source = self._identity_source(platform, stream_id, user_id, nickname, cardname, now)
+        signed = verify_bot_marker(text, self.config.identity.cooperative_secret, platform,
+                                   _signature_scope(message, stream_id), user_id, now)
+        if signed:
+            text = _BOT_MARKER_RE.sub("", text).rstrip()
+        sender = message.get("sender")
+        protocol_bot = (isinstance(sender, dict) and sender.get("bot") is True) or user.get("is_bot") is True
+        is_bot, identity_source = self._identity_source(
+            platform, stream_id, user_id, nickname, cardname, now, signed=signed, protocol_bot=protocol_bot,
+        )
         protected_human = identity_source == "真人白名单"
         # @机器人是正常的人机交互，不作为发送者身份凭据。
 
@@ -796,6 +928,7 @@ class LoopGuardPlugin(MaiBotPlugin):
             is_self=is_self and self.config.action.block_self_echo,
             is_arbiter_primary=self._arbiter_primary(),
             platform=platform, nickname=nickname, cardname=cardname, identity_source=identity_source,
+            verified_human=protected_human,
         )
 
         # 本条照常放行；足够证据后仅登记身份，下一条才应用bot规则。
@@ -888,6 +1021,15 @@ class LoopGuardPlugin(MaiBotPlugin):
         guard = self._registry.get(stream_id, now, platform=platform)
         decision = guard.check_outgoing(now=now, text=text, self_uid=self._primary_self_id(platform))
         if decision.allow:
+            if (self.config.identity.sign_outgoing and self.config.identity.cooperative_secret
+                    and not self.config.plugin.dry_run and not _BOT_MARKER_RE.search(text)):
+                self_uid = self._primary_self_id(platform)
+                if self_uid != "self":
+                    marker = make_bot_marker(text, self.config.identity.cooperative_secret,
+                                             platform, _signature_scope(message, stream_id), self_uid, now)
+                    updated = _append_bot_marker(message, marker)
+                    if updated is not None:
+                        return {"action": "continue", "modified_kwargs": {**kwargs, "message": updated}}
             return None
 
         if self.config.plugin.dry_run:
@@ -1033,6 +1175,8 @@ class LoopGuardPlugin(MaiBotPlugin):
                 uid = str(entry["uid"])
                 is_bot, source = self._identity_source(str(entry["platform"]), guard.stream_id or target, uid,
                                                        str(entry["nickname"]), str(entry["cardname"]), now)
+                if not is_bot and source != "真人白名单" and entry["is_bot"] and entry["identity_source"] in {"协作签名已验证", "适配器bot扩展标志"}:
+                    is_bot, source = True, str(entry["identity_source"])
                 verdict = "机器人" if is_bot else ("真人（白名单）" if source == "真人白名单" else "待观察/身份未知")
                 age = max(0.0, now - float(entry["last_ts"]))
                 lines.append(f"- {uid}：{verdict}，{entry['count']} 条，{age:.0f}s 前；依据：{source}")
@@ -1061,7 +1205,8 @@ class LoopGuardPlugin(MaiBotPlugin):
         snap = guard.snapshot(now)
         report = (
             f"流 {target}：连续机器人消息 {snap['chain_length']} 条，退避档位 {snap['strike']}，"
-            f"剩余冷却 {snap['cooldown_remaining']}s，累计拦截 {snap['suppressed']} 次，"
+            f"剩余冷却 {guard.cooldown_remaining(now):.0f}s（独立出站熔断 {snap['outgoing_fuse_remaining']}s），"
+            f"出站窗口 {snap['outgoing_fuse_count']}/{self.config.action.outgoing_fuse_max_count} 条，累计拦截 {snap['suppressed']} 次，"
             f"最近原因 {snap['last_reason'] or '无'}；窗口指纹 {snap['window_records']} 条；"
             f"全局统计 入站拦截 {self._stats['incoming_blocked']}、出站拦截 {self._stats['outgoing_blocked']}"
         )
@@ -1121,10 +1266,12 @@ class LoopGuardPlugin(MaiBotPlugin):
                         continue
                     try:
                         remaining = float(value.get("cooldown_remaining") or 0.0)
-                        data = dict(value, cooldown_remaining=max(0.0, remaining - elapsed))
+                        fuse_remaining = float(value.get("outgoing_fuse_remaining") or 0.0)
+                        data = dict(value, cooldown_remaining=max(0.0, remaining - elapsed),
+                                    outgoing_fuse_remaining=max(0.0, fuse_remaining - elapsed))
                         if elapsed > self.config.detect.window_seconds:
                             data["chain_length"] = 0
-                        if math.isfinite(remaining):
+                        if math.isfinite(remaining) and math.isfinite(fuse_remaining):
                             restored[str(key)] = data
                     except (TypeError, ValueError):
                         continue

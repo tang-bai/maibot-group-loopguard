@@ -1,5 +1,13 @@
 # CHANGELOG
 
+## 1.3.0
+
+- 新增独立出站频率熔断：默认单聊天流60秒内最多放行6条，第7条静默120秒；不依赖发送者bot身份，未知账号发言不清预算，仅真人白名单重置。不同流隔离，计数与剩余冷却跨重载/重启保留。
+- 新增共享机器人名册配置键、仲裁名单复用以及可选可信适配器bot扩展字段；OneBot v11标准没有通用的sender.bot，默认不信任该扩展。
+- 增加可选受控bot间的LG1协作标记：对平台、流、发送者、时间和正文做HMAC签名，验证后直接识别；文本标记、转发、篡改、跨群与超时均不会单凭标记定性。默认不在外发消息追加可见标记，需在适配器现场验证。
+- 为上述行为新增单元及Hook回归，合计98项，当前无真实SDK环境下95通过、3项Schema测试跳过。发送前计数仍按尝试记账；跨框架签名投递待真实适配器验证。
+- 调研参考：[openclaw-napcat](https://github.com/Daiyimo/openclaw-napcat)、[Pallas-Bot](https://github.com/PallasBot/Pallas-Bot/blob/main/pallas/core/platform/multi_bot/bot_filter.py)、[AstrBot多Bot循环问题](https://github.com/AstrBotDevs/AstrBot/issues/10724)。
+
 ## 1.2.0
 
 - 身份判定改为保守证据机制：单次复制、@机器人、昵称命中默认均不直接定性。新增真人白名单，优先于机器人名单和自动学习（自身回声识别除外）。

@@ -204,6 +204,10 @@ class GuardParams:
     identity_window_seconds: float = 180.0
     identity_min_text_length: int = 12
     identity_response_within_seconds: float = 60.0
+    outgoing_fuse_enabled: bool = True
+    outgoing_fuse_max_count: int = 6
+    outgoing_fuse_window_seconds: float = 60.0
+    outgoing_fuse_cooldown_seconds: float = 120.0
 
 
 @dataclass(slots=True)
@@ -299,6 +303,8 @@ class StreamGuard:
         self._allowed_bot = 0
         self._last_reason = ""
         self._outgoing: Deque[MessageRecord] = deque(maxlen=10)
+        self._outgoing_times: Deque[float] = deque(maxlen=max(8, self.params.outgoing_fuse_max_count + 1))
+        self._outgoing_fuse_until = 0.0
         self._suspect_strikes: dict[str, Deque[float]] = {}
         self._last_suspect_ts: dict[str, float] = {}
 
@@ -330,7 +336,15 @@ class StreamGuard:
     def cooldown_remaining(self, now: float) -> float:
         """剩余冷却秒数。"""
 
-        return max(0.0, self._cooldown_until - now)
+        return max(0.0, self._cooldown_until - now, self._outgoing_fuse_until - now)
+
+    def outgoing_fuse_count(self, now: float) -> int:
+        """即使未知账号清掉入站链条，也保留尚在时间窗内的出站预算。"""
+
+        cutoff = now - max(1.0, self.params.outgoing_fuse_window_seconds)
+        while self._outgoing_times and self._outgoing_times[0] < cutoff:
+            self._outgoing_times.popleft()
+        return len(self._outgoing_times)
 
     def snapshot(self, now: float) -> dict[str, object]:
         """导出可序列化的状态快照。"""
@@ -338,7 +352,10 @@ class StreamGuard:
         return {
             "chain_length": self._chain_length,
             "strike": self._strike,
-            "cooldown_remaining": round(self.cooldown_remaining(now), 3),
+            "cooldown_remaining": round(max(0.0, self._cooldown_until - now), 3),
+            "outgoing_fuse_remaining": round(max(0.0, self._outgoing_fuse_until - now), 3),
+            "outgoing_fuse_count": self.outgoing_fuse_count(now),
+            "outgoing_times": list(self._outgoing_times),
             "suppressed": self._suppressed,
             "allowed_bot": self._allowed_bot,
             "last_reason": self._last_reason,
@@ -353,6 +370,20 @@ class StreamGuard:
         self._strike = int(data.get("strike") or 0)
         remaining = float(data.get("cooldown_remaining") or 0.0)
         self._cooldown_until = now + max(0.0, remaining)
+        self._outgoing_fuse_until = (now + max(0.0, float(data.get("outgoing_fuse_remaining") or 0.0))
+                                     if self.params.outgoing_fuse_enabled else 0.0)
+        self._outgoing_times.clear()
+        recent = data.get("outgoing_times")
+        if isinstance(recent, list) and self.params.outgoing_fuse_enabled:
+            horizon = now - max(1.0, self.params.outgoing_fuse_window_seconds)
+            for value in recent[-self._outgoing_times.maxlen:]:
+                try:
+                    timestamp = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if horizon <= timestamp <= now:
+                    self._outgoing_times.append(timestamp)
+            self._outgoing_times = deque(sorted(self._outgoing_times), maxlen=self._outgoing_times.maxlen)
         self._suppressed = int(data.get("suppressed") or 0)
         self._allowed_bot = int(data.get("allowed_bot") or 0)
         self._last_reason = str(data.get("last_reason") or "")
@@ -366,6 +397,8 @@ class StreamGuard:
             self._records.popleft()
         while self._outgoing and self._outgoing[0].ts < now - max(1.0, self.params.window_seconds):
             self._outgoing.popleft()
+        while self._outgoing_times and self._outgoing_times[0] < now - max(1.0, self.params.outgoing_fuse_window_seconds):
+            self._outgoing_times.popleft()
         if not self._records or self._records[-1].ts < now - max(1.0, self.params.window_seconds):
             self._chain_length = 0
         ttl = max(10.0, self.params.suspect_strike_ttl_seconds)
@@ -604,12 +637,16 @@ class StreamGuard:
             if item.uid == uid:
                 item.is_bot = False
 
-    def observe_human(self, now: float, uid: str = "") -> None:
+    def observe_human(self, now: float, uid: str = "", *, verified_human: bool = False) -> None:
         """记录一条人类消息：清零链条、衰减退避档位。"""
 
         self._last_human_ts = now
         self._chain_length = 0
         self._cooldown_until = 0.0
+        # 未知身份默认放行，但不能凭一条未知账号消息重置独立出站预算。
+        if verified_human:
+            self._outgoing_times.clear()
+            self._outgoing_fuse_until = 0.0
         if self.params.strike_decay_on_human and self._strike > 0:
             self._strike -= 1
 
@@ -626,6 +663,7 @@ class StreamGuard:
         nickname: str = "",
         cardname: str = "",
         identity_source: str = "",
+        verified_human: bool = False,
     ) -> Decision:
         """判定一条入站消息是否应当进入 MaiBot 主链。
 
@@ -668,7 +706,7 @@ class StreamGuard:
         self._records.append(record)
 
         if not is_bot:
-            self.observe_human(now, uid)
+            self.observe_human(now, uid, verified_human=verified_human)
             return Decision(allow=True, reason="human")
 
         self._chain_length += 1
@@ -753,8 +791,13 @@ class StreamGuard:
         pool.extend(self._outgoing)
         duplicate = self._matches_any(record, pool)
 
-        if remaining > 0:
+        if self._outgoing_fuse_until > now:
+            reason = "outgoing_fuse_cooldown"
+        elif remaining > 0:
             reason = "cooldown"
+        elif self.params.outgoing_fuse_enabled and len(self._outgoing_times) >= max(1, self.params.outgoing_fuse_max_count):
+            reason = "outgoing_fuse"
+            self._outgoing_fuse_until = now + max(1.0, self.params.outgoing_fuse_cooldown_seconds)
         elif next_chain >= max_chain:
             reason = "chain_limit"
         elif duplicate:
@@ -766,11 +809,13 @@ class StreamGuard:
             self._records.append(record)
             self._chain_length = next_chain
             self._outgoing.append(record)
+            if self.params.outgoing_fuse_enabled:
+                self._outgoing_times.append(now)
             return Decision(allow=True, reason="allow_outgoing", duplicate=False, chain_length=next_chain)
 
         self._suppressed += 1
         self._last_reason = reason
-        if reason != "cooldown":
+        if reason not in {"cooldown", "outgoing_fuse", "outgoing_fuse_cooldown"}:
             self._register_strike(now)
         return Decision(
             allow=False,
@@ -841,6 +886,7 @@ class GuardRegistry:
             stream_id: guard.snapshot(now)
             for stream_id, guard in self._guards.items()
             if guard.suppressed or guard.chain_length or guard.cooldown_remaining(now) > 0
+            or guard.outgoing_fuse_count(now) > 0
         }
 
     def restore(self, data: dict[str, dict[str, object]], now: float) -> None:
