@@ -6,7 +6,7 @@
 [![MaiBot](https://img.shields.io/badge/MaiBot-1.3.x-8fd6a0)](https://github.com/Mai-with-u/MaiBot)
 [![Plugin SDK](https://img.shields.io/badge/plugin--sdk-%E2%89%A52.0-8fd6a0)](https://docs.maibot.chat/plugin/)
 [![License](https://img.shields.io/badge/license-GPL--3.0--or--later-blue)](./LICENSE)
-[![Tests](https://img.shields.io/badge/tests-34%20passed-brightgreen)](./plugins/maibot-group-loopguard/tests)
+[![Tests](https://img.shields.io/badge/tests-84%20cases-brightgreen)](./plugins/maibot-group-loopguard/tests)
 
 ---
 
@@ -37,7 +37,8 @@ Bot-B：那我也来，几点开始？？
 ## 判定逻辑
 
 ```
-身份层   显式名单 → 行为学习（30s 内复述他人内容）→ 昵称正则 → 机器人互 @
+身份层   自身账号 → 真人白名单 → 机器人名单 → 当前群临时学习
+         多轮回声 + 不同来源内容 + bot响应锚点；昵称默认仅提示，@不定性
 内容层   BLAKE2b digest（逐字）· SimHash（逐字快筛）
          2-gram Jaccard ≥ 0.72 · 2-gram 包含度 ≥ 0.85（抄一遍再补几个字）
 节奏层   连续机器人消息 ≥ 4 · 双账号交替接话 · 60s 内 ≥ 6 条爆发
@@ -66,7 +67,7 @@ Bot-B：那我也来，几点开始？？
 cp -r plugins/maibot-group-loopguard <MaiBot>/plugins/
 
 # 方式二：用 Release 里的 zip
-unzip maibot-group-loopguard-1.0.0.zip -d <MaiBot>/plugins/
+unzip maibot-group-loopguard-1.2.0.zip -d <MaiBot>/plugins/
 
 # 方式三：自己打包（ZIP 内路径统一用 /，符合 WebUI 安装校验）
 python tools/build_package.py
@@ -90,14 +91,17 @@ enabled = true
 dry_run = true          # 先演习一天，看日志里"[dry-run] 本应拦截"的文本是否都是复读
 
 [identity]
-bot_accounts = ["另一只机器人的QQ号"]   # 最重要的一项
+bot_accounts = ["另一只机器人的QQ号"]   # 最可靠的识别依据
+human_accounts = ["确认是真人的QQ号"]   # 真人白名单，避免误伤
+trust_name_patterns = false           # 昵称只提示，不直接定性
+learned_ttl_seconds = 1800            # 自动学习默认30分钟
 
 [arbiter]
 enabled = true
 peers = ["另一只机器人的QQ号"]          # 两只都装时，让发言权按账号字典序错开
 ```
 
-完整配置项（6 个 section、40+ 字段）、场景模板与排错表见 [docs/02-使用与部署.md](./docs/02-使用与部署.md)。
+完整配置项（7 个 section、53 个字段）、场景模板与排错表见 [docs/02-使用与部署.md](./docs/02-使用与部署.md)。
 
 > WebUI 配置页的字段名已全部汉化（Schema `label`），`config.toml` 的键名保持英文；改完重载插件并硬刷新页面即可看到。
 
@@ -108,6 +112,7 @@ peers = ["另一只机器人的QQ号"]          # 两只都装时，让发言权
 | 命令 | 说明 |
 | --- | --- |
 | `/loopguard` | 查看当前流：链条长度、退避档位、剩余冷却、拦截计数 |
+| `/loopguard who` | 查看当前身份依据、回声次数、已知bot响应与独立窗口 |
 | `/loopguard reset [stream_id]` | 重置指定流（留空重置全部） |
 | `/loopguard learn <账号>` / `forget <账号>` | 手动增删行为学习名单 |
 | `/loopguard on` / `off` | 进程内临时开关 |
@@ -120,7 +125,7 @@ peers = ["另一只机器人的QQ号"]          # 两只都装时，让发言权
 
 ```bash
 cd plugins/maibot-group-loopguard
-python -m unittest discover -s tests -v     # 34 个用例：21 算法 + 10 Hook 冒烟 + 3 Schema 标签
+python -m unittest discover -s tests -v     # 84 项；无真实SDK时81通过、3项Schema跳过
 python ../../tools/loop_sim.py             # 双机器人收敛模拟
 ```
 
@@ -139,7 +144,7 @@ python ../../tools/loop_sim.py             # 双机器人收敛模拟
 │   ├── _manifest.json          # Manifest v2（id: maibot-community.group-loop-guard）
 │   ├── plugin.py               # Hook 适配 / 身份识别 / 持久化 / 命令
 │   ├── loopguard_core.py       # 纯标准库算法：规范化、指纹、状态机、仲裁
-│   ├── tests/                  # 34 个用例 + SDK 替身
+│   ├── tests/                  # 84 项用例 + SDK 替身
 │   ├── README.md
 │   └── CHANGELOG.md
 └── tools/
@@ -163,7 +168,9 @@ python ../../tools/loop_sim.py             # 双机器人收敛模拟
 
 - **语义级改写**不靠指纹抓，靠链条长度与交替节奏兜底；`max_chain_length` 是最终保险。
 - **单边生效**：只装一边也能显著降频（对方连发会持续撞冷却），但两边都装才对称。
-- **名单仍需维护**：行为学习只覆盖"复述他人内容"的场景，内容完全不同的互激靠链条上限。
+- **身份是启发式判断**：聊天文本本身不能证明真实身份。默认先观察未知账号；单次复制、@、昵称都不直接判bot。
+- **不复读的未知bot**：可开启可选的频率嫌疑（须多窗口响应已知bot）；显式 bot_accounts 仍最可靠。链条上限只对已识别bot生效。
+- **升级**：v1旧学习名单和冷却自动清理，手工临时learn也需重新登记；配置中的bot_accounts保留。
 - **拦截即不入记忆**：这是有意为之，复读内容进上下文只会让下一轮更像复读。
 
 ## 常见问题

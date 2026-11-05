@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import re
 import time
 from pathlib import Path
@@ -68,7 +69,7 @@ normalize_text = _CORE.normalize_text
 hamming_distance = _CORE.hamming_distance
 
 _STATE_FILE = "loopguard_state.json"
-_STATE_VERSION = 1
+_STATE_VERSION = 2
 
 
 # ─── 配置模型 ────────────────────────────────────────────────────────
@@ -116,7 +117,7 @@ class PluginSection(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = _cfg("启用复读守卫", default=True, description="总开关；关闭后所有 Hook 直接放行")
-    config_version: str = _cfg("配置版本（勿改）", default="1.0.0", description="Runner 用它判断配置迁移，请保持默认")
+    config_version: str = _cfg("配置版本（勿改）", default="1.2.0", description="Runner 用它判断配置迁移，请保持默认")
     dry_run: bool = _cfg(
         "演习模式",
         default=False,
@@ -137,6 +138,28 @@ class IdentitySection(PluginConfigBase):
         description="同群其它 AI 的账号，填 QQ 号即可（也可写 qq:123456）；这一项最关键",
         placeholder="例如 123456789",
     )
+    human_accounts: list[str] = _cfg(
+        "已知真人账号", default_factory=list,
+        description="真人白名单，优先于机器人名单、昵称与自动学习；支持 qq:账号",
+    )
+    trust_name_patterns: bool = _cfg(
+        "信任昵称匹配结果", default=False,
+        description="默认昵称仅作提示；开启后命中正则直接按机器人处理，可能误伤真人",
+    )
+    behavior_min_echoes: int = _cfg(
+        "行为学习最少回声轮数", default=3,
+        description="至少3次回声且包含不同来源内容；有已知bot响应锚点才提升，纯未知场景额外要求一轮",
+    )
+    behavior_window_seconds: int = _cfg(
+        "行为证据窗口（秒）", default=180, description="过期回声证据自动丢弃",
+    )
+    behavior_min_text_length: int = _cfg(
+        "行为证据最短长度", default=12, description="双方文本均达到该长度才视为回声信号",
+    )
+    behavior_response_within_seconds: int = _cfg(
+        "行为回声响应间隔（秒）", default=60,
+        description="匹配来源文本的最大时间差；慢速模型可调大，默认60秒",
+    )
     self_accounts: list[str] = _cfg(
         "本实例账号",
         default_factory=list,
@@ -146,15 +169,15 @@ class IdentitySection(PluginConfigBase):
     name_patterns: list[str] = _cfg(
         "昵称匹配正则",
         default_factory=lambda: [r"(?i)(bot|机器人|助手|麦麦|maisaka|assistant)$"],
-        description="昵称或群名片命中即按机器人处理；填 .* 等于关闭昵称识别",
+        description="昵称或群名片命中仅作提示；关闭这一层请用空列表 []，.* 会匹配所有人",
     )
     auto_learn_behavior: bool = _cfg(
         "行为学习",
         default=True,
-        description="未登记账号若在 30 秒内复述他人内容，自动临时记为机器人（首条只登记、不惩罚）",
+        description="按多轮回声、不同来源文本和已知bot响应累计证据，单次复制不登记；仅在当前平台和聊天流生效",
     )
     learned_ttl_seconds: int = _cfg(
-        "学习结果保留时长（秒）", default=86400, description="行为学习名单的过期时间，到期自动遗忘"
+        "学习结果保留时长（秒）", default=1800, description="自动学习的过期时间；默认30分钟，到期重新观察"
     )
     platform_scope: list[str] = _cfg(
         "生效平台",
@@ -289,7 +312,7 @@ class SuspectSection(PluginConfigBase):
     enabled: bool = _cfg(
         "启用频率嫌疑识别",
         default=False,
-        description="按「高频 + 紧跟别人发言」识别未登记的 bot。误判会把真人当 bot，建议先开演习模式观察",
+        description="累计独立窗口内的高频响应；须多次接在已知bot后面才自动标记，建议先开演习观察",
     )
     window_seconds: int = _cfg("统计窗口（秒）", default=60, description="评估单个账号发言模式的时间窗")
     min_messages: int = _cfg("窗口内发言次数阈值", default=5, description="达到该条数才进入嫌疑评估")
@@ -345,14 +368,31 @@ def _extract_text(message: dict[str, Any]) -> str:
             data = component.get("data")
             if component_type == "text" and isinstance(data, str):
                 parts.append(data)
-            elif component_type == "at" and isinstance(data, dict):
-                nickname = data.get("target_user_nickname") or data.get("target_user_cardname") or ""
-                parts.append(f"@{nickname}")
-            elif component_type == "reply" and isinstance(data, dict):
-                quoted = data.get("target_message_content")
-                if isinstance(quoted, str) and quoted.strip():
-                    parts.append(quoted)
+            elif component_type == "text" and isinstance(data, dict):
+                parts.append(str(data.get("text") or ""))
+            elif component_type in {"at", "reply"}:
+                # 引文不属于发送者新写的正文；@也不应吞掉紧随其后的正文。
+                parts.append(" ")
     return "".join(parts)
+
+
+def _stream_id(message: dict[str, Any], fallback: str = "") -> str:
+    """使用稳定会话键，避免每条 message_id 生成独立状态。"""
+
+    session = str(message.get("session_id") or fallback or "")
+    if session:
+        return session
+    info = message.get("message_info")
+    if not isinstance(info, dict):
+        return ""
+    platform = str(message.get("platform") or "").lower()
+    group = info.get("group_info")
+    if isinstance(group, dict) and group.get("group_id"):
+        return f"{platform}_group_{group['group_id']}"
+    user = info.get("user_info")
+    if isinstance(user, dict) and user.get("user_id"):
+        return f"{platform}_private_{user['user_id']}"
+    return ""
 
 
 def _extract_at_targets(message: dict[str, Any]) -> set[str]:
@@ -408,6 +448,7 @@ class LoopGuardPlugin(MaiBotPlugin):
         self._registry: Any = None
         self._self_accounts: dict[str, set[str]] = {}
         self._learned: dict[str, float] = {}
+        self._learned_sources: dict[str, str] = {}
         self._braked: set[str] = set()
         self._state_path: Path | None = None
         self._save_task: asyncio.Task[None] | None = None
@@ -487,6 +528,10 @@ class LoopGuardPlugin(MaiBotPlugin):
             suspect_responsive_within_seconds=float(self.config.suspect.responsive_within_seconds),
             suspect_strikes_to_mark=int(self.config.suspect.strikes_to_mark),
             suspect_strike_ttl_seconds=float(self.config.suspect.strike_ttl_seconds),
+            identity_min_echoes=int(self.config.identity.behavior_min_echoes),
+            identity_window_seconds=float(self.config.identity.behavior_window_seconds),
+            identity_min_text_length=int(self.config.identity.behavior_min_text_length),
+            identity_response_within_seconds=float(self.config.identity.behavior_response_within_seconds),
         )
 
     # ── 身份识别 ────────────────────────────────────────────────
@@ -547,79 +592,91 @@ class LoopGuardPlugin(MaiBotPlugin):
         )
         return sorted(accounts)[0] if accounts else "self"
 
-    def _learned_hit(self, user_id: str, now: float) -> bool:
-        """判断账号是否在行为学习名单内且未过期。"""
+    @staticmethod
+    def _scope_key(platform: str, stream_id: str, user_id: str) -> str:
+        """结构化作用域，避免平台同号或不同群互相污染。"""
 
-        expire_at = self._learned.get(user_id)
-        if expire_at is None:
-            return False
-        if expire_at <= now:
-            self._learned.pop(user_id, None)
-            self._dirty = True
-            return False
-        return True
+        return json.dumps([str(platform or "").lower(), str(stream_id or ""), _norm_account(user_id)], separators=(",", ":"))
 
-    def _remember_learned(self, user_id: str, now: float, ttl_seconds: int = 0) -> None:
-        """把一个账号写入行为学习名单。"""
+    def _learned_key(self, platform: str, stream_id: str, user_id: str, now: float) -> str:
+        for plat, stream in ((platform, stream_id), (platform, ""), ("", stream_id), ("", "")):
+            key = self._scope_key(plat, stream, user_id)
+            expires = self._learned.get(key, 0)
+            if expires > now:
+                return key
+            if key in self._learned:
+                self._learned.pop(key, None)
+                self._learned_sources.pop(key, None)
+                self._dirty = True
+        return ""
 
+    def _learned_hit(self, user_id: str, now: float, *, platform: str = "", stream_id: str = "") -> bool:
+        return bool(self._learned_key(platform, stream_id, user_id, now))
+
+    def _remember_learned(self, user_id: str, now: float, ttl_seconds: int = 0, *,
+                          platform: str = "", stream_id: str = "", source: str = "manual") -> None:
         if not user_id:
             return
         ttl = max(60, int(ttl_seconds or self.config.identity.learned_ttl_seconds))
-        self._learned[user_id] = now + ttl
+        key = self._scope_key(platform, stream_id, user_id)
+        self._learned[key] = now + ttl
+        self._learned_sources[key] = source
         self._dirty = True
 
-    def _check_frequency_suspect(self, guard: Any, stream_id: str, user_id: str, nickname: str, now: float) -> None:
-        """频率嫌疑：高频 + 紧跟别人发言，累计 N 次后把账号标为 bot。
-
-        只在 `suspect.enabled = true` 时生效。标记本身不拦截本条消息，
-        下一条起该账号就按机器人规则走，与显式名单效果一致。
-        """
-
-        if not self.config.suspect.enabled or not user_id:
-            return
-        try:
-            report = guard.check_frequency(now=now, uid=user_id)
-            if not report.suspect:
-                return
-            self.ctx.logger.info(
-                "[loopguard] 频率嫌疑 stream=%s sender=%s 窗口内 %d 条（接话 %.0f%%）嫌疑 %d/%d",
-                stream_id,
-                user_id,
-                report.count,
-                report.ratio * 100,
-                report.strikes,
-                self.config.suspect.strikes_to_mark,
-            )
-            if report.mark:
-                self._remember_learned(user_id, now, ttl_seconds=int(self.config.suspect.mark_ttl_seconds))
-                self.ctx.logger.warning(
-                    "[loopguard] %s(%s) 呈现被触发型 bot 发言模式，已标记为机器人（%d 秒后失效）",
-                    nickname or user_id,
-                    user_id,
-                    self.config.suspect.mark_ttl_seconds,
-                )
-        except Exception as exc:
-            self.ctx.logger.debug("频率嫌疑评估失败已跳过：%s", exc)
-
-    def _is_bot_account(self, platform: str, user_id: str, nickname: str, cardname: str, now: float) -> bool:
-        """按"名单 → 行为学习 → 昵称正则"的顺序判定发送者是不是机器人。"""
-
+    @staticmethod
+    def _account_in(entries: list[str], platform: str, user_id: str) -> bool:
         account = _norm_account(user_id)
-        for entry in self.config.identity.bot_accounts:
-            entry_platform, entry_account = _norm_platform_account(entry)
-            if not entry_account or entry_account != account:
-                continue
-            if not entry_platform or entry_platform == str(platform or "").lower():
-                return True
-        if self._learned_hit(account, now):
-            return True
+        return bool(account) and any(
+            entry_account == account and (not entry_platform or entry_platform == str(platform or "").lower())
+            for entry_platform, entry_account in map(_norm_platform_account, entries)
+        )
+
+    def _name_hit(self, nickname: str, cardname: str) -> bool:
         for pattern in self.config.identity.name_patterns:
             try:
-                if re.search(pattern, f"{nickname} {cardname}".strip()):
+                if any(name and re.search(pattern, name) for name in (nickname.strip(), cardname.strip())):
                     return True
             except re.error:
                 self.ctx.logger.warning("昵称正则无效已跳过：%s", pattern)
         return False
+
+    def _identity_source(self, platform: str, stream_id: str, user_id: str,
+                         nickname: str, cardname: str, now: float) -> tuple[bool, str]:
+        if self._is_self(platform, user_id):
+            return True, "本实例账号"
+        if self._account_in(self.config.identity.human_accounts, platform, user_id):
+            return False, "真人白名单"
+        if self._account_in(self.config.identity.bot_accounts, platform, user_id):
+            return True, "机器人名单"
+        key = self._learned_key(platform, stream_id, user_id, now)
+        if key:
+            return True, "临时学习：" + self._learned_sources.get(key, "manual")
+        if self._name_hit(nickname, cardname):
+            if self.config.identity.trust_name_patterns:
+                return True, "昵称正则（已配置信任）"
+            return False, "昵称命中（弱信号，待观察）"
+        return False, "身份未知（按普通消息放行）"
+
+    def _is_bot_account(self, platform: str, user_id: str, nickname: str, cardname: str, now: float,
+                        stream_id: str = "") -> bool:
+        return self._identity_source(platform, stream_id, user_id, nickname, cardname, now)[0]
+
+    def _check_frequency_suspect(self, guard: Any, stream_id: str, user_id: str, nickname: str,
+                                 now: float, platform: str = "") -> None:
+        if not self.config.suspect.enabled or not user_id:
+            return
+        report = guard.check_frequency(now=now, uid=user_id)
+        if not report.suspect:
+            return
+        self.ctx.logger.debug(
+            "[loopguard] 频率嫌疑 stream=%s sender=%s count=%d 接话=%.0f%% bot响应=%.0f%% windows=%d",
+            stream_id, user_id, report.count, report.ratio * 100, report.bot_ratio * 100, report.strikes,
+        )
+        if report.mark:
+            self._remember_learned(user_id, now, ttl_seconds=int(self.config.suspect.mark_ttl_seconds),
+                                   platform=platform, stream_id=stream_id, source="多窗口已知bot响应")
+            guard.consume_identity(user_id)
+            self.ctx.logger.info("[loopguard] 频率识别 stream=%s sender=%s windows=%d", stream_id, user_id, report.strikes)
 
     def _platform_allowed(self, platform: str) -> bool:
         """判断当前平台是否在生效范围内。"""
@@ -656,12 +713,12 @@ class LoopGuardPlugin(MaiBotPlugin):
         except Exception as exc:
             self.ctx.logger.debug("频率刹车未生效：%s", exc)
 
-    async def _release_brake(self, stream_id: str, now: float) -> None:
+    async def _release_brake(self, stream_id: str, now: float, platform: str = "") -> None:
         """冷却结束后恢复回复频率。"""
 
         if stream_id not in self._braked or self._registry is None:
             return
-        guard = self._registry.get(stream_id, now)
+        guard = self._registry.get(stream_id, now, platform=platform)
         if guard.cooldown_remaining(now) > 0:
             return
         try:
@@ -707,7 +764,7 @@ class LoopGuardPlugin(MaiBotPlugin):
         if not self._platform_allowed(platform):
             return None
 
-        stream_id = str(message.get("session_id") or message.get("message_id") or "")
+        stream_id = _stream_id(message, str(kwargs.get("session_id") or ""))
         if not stream_id:
             return None
 
@@ -718,35 +775,18 @@ class LoopGuardPlugin(MaiBotPlugin):
         nickname = str(user.get("user_nickname") or "")
         cardname = str(user.get("user_cardname") or "")
 
+        if not user_id:
+            # 非聊天事件或坏载荷不应被当成真人来解除整流冷却。
+            return None
+
         now = time.time()
         text = _extract_text(message)
-        guard = self._registry.get(stream_id, now)
+        guard = self._registry.get(stream_id, now, platform=platform)
 
         is_self = self._is_self(platform, user_id)
-        is_bot = is_self or self._is_bot_account(platform, user_id, nickname, cardname, now)
-
-        if not is_bot and self.config.identity.auto_learn_behavior:
-            try:
-                if guard.looks_like_bot_echo(now=now, uid=user_id, text=text):
-                    is_bot = True
-                    self._remember_learned(_norm_account(user_id), now)
-                    self.ctx.logger.info(
-                        "[loopguard] 行为识别：%s(%s) 复述了机器人内容，已临时记为机器人", nickname or user_id, user_id
-                    )
-            except Exception as exc:
-                self.ctx.logger.debug("行为识别失败已跳过：%s", exc)
-
-        # 机器人 @ 另一个已知机器人：这是最典型的互激链路，直接按机器人处理。
-        # 只 @ 已知机器人、没有任何人类参与的消息，发送者本身多半是机器人。
-        # 真人说话通常带上下文或@的是人，不会只对着机器人发号施令。
-        # 仅在名单里有已知机器人时生效，避免把真人@机器人也误判。
-        at_targets = _extract_at_targets(message)
-        if not is_bot and at_targets:
-            known = {_norm_account(item) for item in self.config.identity.bot_accounts if _norm_account(item)}
-            known |= set(self._self_accounts.get(str(platform).lower(), set()))
-            if at_targets & known:
-                is_bot = True
-                self.ctx.logger.debug("[loopguard] %s(%s) @ 了已知机器人，按机器人消息处理", nickname, user_id)
+        is_bot, identity_source = self._identity_source(platform, stream_id, user_id, nickname, cardname, now)
+        protected_human = identity_source == "真人白名单"
+        # @机器人是正常的人机交互，不作为发送者身份凭据。
 
         decision = guard.evaluate(
             now=now,
@@ -755,16 +795,25 @@ class LoopGuardPlugin(MaiBotPlugin):
             text=text,
             is_self=is_self and self.config.action.block_self_echo,
             is_arbiter_primary=self._arbiter_primary(),
+            platform=platform, nickname=nickname, cardname=cardname, identity_source=identity_source,
         )
 
-        # 本条已计入窗口，此刻评估发言模式最完整；仅登记身份，不额外惩罚本条
-        if not is_bot:
-            self._check_frequency_suspect(guard, stream_id, user_id, nickname, now)
+        # 本条照常放行；足够证据后仅登记身份，下一条才应用bot规则。
+        if not is_bot and not protected_human and user_id:
+            if self.config.identity.auto_learn_behavior:
+                report = guard.identity_report(now=now, uid=user_id)
+                if report.mark:
+                    self._remember_learned(user_id, now, platform=platform, stream_id=stream_id,
+                                           source="多轮回声；" + "；".join(report.reasons))
+                    guard.consume_identity(user_id)
+                    self.ctx.logger.info("[loopguard] 行为识别 stream=%s sender=%s evidence=%s", stream_id, user_id, report.reasons)
+            self._check_frequency_suspect(guard, stream_id, user_id, nickname, now, platform)
+        self.ctx.logger.debug("[loopguard] 身份 stream=%s sender=%s bot=%s source=%s", stream_id, user_id, is_bot, identity_source)
 
         if decision.allow:
             if is_bot:
                 self._stats["allowed_bot"] += 1
-            await self._release_brake(stream_id, now)
+            await self._release_brake(stream_id, now, platform)
             return None
 
         if not self.config.action.block_incoming:
@@ -827,7 +876,7 @@ class LoopGuardPlugin(MaiBotPlugin):
         if not self._platform_allowed(platform):
             return None
 
-        stream_id = str(message.get("session_id") or "")
+        stream_id = _stream_id(message, str(kwargs.get("session_id") or ""))
         if not stream_id:
             return None
 
@@ -836,7 +885,7 @@ class LoopGuardPlugin(MaiBotPlugin):
             return None
 
         now = time.time()
-        guard = self._registry.get(stream_id, now)
+        guard = self._registry.get(stream_id, now, platform=platform)
         decision = guard.check_outgoing(now=now, text=text, self_uid=self._primary_self_id(platform))
         if decision.allow:
             return None
@@ -875,7 +924,7 @@ class LoopGuardPlugin(MaiBotPlugin):
     async def soft_mute_planner(self, **kwargs: Any) -> dict[str, Any] | None:
         """冷却期内移除 reply 类工具。"""
 
-        if self._registry is None or not self.config.plugin.enabled:
+        if self._registry is None or not self.config.plugin.enabled or self.config.plugin.dry_run:
             return None
         if not self.config.action.soft_mute_reply_tool:
             return None
@@ -885,7 +934,10 @@ class LoopGuardPlugin(MaiBotPlugin):
             return None
 
         now = time.time()
-        guard = self._registry.get(stream_id, now)
+        try:
+            guard = self._registry.get(stream_id, now, platform=str(kwargs.get("platform") or ""))
+        except ValueError:
+            return None
         if guard.cooldown_remaining(now) <= 0:
             return None
 
@@ -942,12 +994,21 @@ class LoopGuardPlugin(MaiBotPlugin):
         if sub == "learn":
             if not arg:
                 return False, "用法：/loopguard learn <账号>", True
-            self._remember_learned(_norm_account(arg), now)
+            platform, account = _norm_platform_account(arg)
+            platform = platform or str(kwargs.get("platform") or "")
+            self._remember_learned(account, now, platform=platform, stream_id=stream_id)
             return True, f"已把 {_norm_account(arg)} 记为机器人，{self.config.identity.learned_ttl_seconds} 秒后遗忘", True
         if sub == "forget":
             if not arg:
                 return False, "用法：/loopguard forget <账号>", True
-            self._learned.pop(_norm_account(arg), None)
+            platform, account = _norm_platform_account(arg)
+            for key in list(self._learned):
+                plat, _, uid = json.loads(key)
+                if uid == account and (not platform or plat == platform):
+                    self._learned.pop(key, None)
+                    self._learned_sources.pop(key, None)
+            if self._registry is not None:
+                self._registry.forget_identity(account, platform=platform)
             self._dirty = True
             return True, f"已移除行为学习记录：{_norm_account(arg)}", True
         if sub == "who":
@@ -956,37 +1017,45 @@ class LoopGuardPlugin(MaiBotPlugin):
             target = arg or stream_id
             if not target:
                 return False, "用法：/loopguard who [stream_id]", True
-            guard = self._registry.get(target, now)
+            try:
+                guard = self._registry.get(target, now, platform=str(kwargs.get("platform") or ""))
+            except ValueError as exc:
+                return False, str(exc), True
             senders = guard.senders(now)
             if not senders:
                 return True, f"流 {target} 的窗口内还没有记录到任何消息", True
             lines = [
-                f"流 {target} 窗口内的发送者（近 {int(self.config.detect.window_seconds)} 秒）：",
+                f"流 {target} 窗口内的发送者（证据保留上限 {int(max(self.config.detect.window_seconds, self.config.identity.behavior_window_seconds, self.config.suspect.window_seconds))} 秒，最多 {self.config.detect.max_records} 条）：",
                 f"守卫状态：启用={self.config.plugin.enabled} 演习={self.config.plugin.dry_run} "
                 f"链条={guard.chain_length} 退避={guard.strike} 剩余冷却={guard.cooldown_remaining(now):.0f}s",
             ]
             for entry in senders[:8]:
-                verdict = "机器人" if entry["is_bot"] else "当人类处理"
+                uid = str(entry["uid"])
+                is_bot, source = self._identity_source(str(entry["platform"]), guard.stream_id or target, uid,
+                                                       str(entry["nickname"]), str(entry["cardname"]), now)
+                verdict = "机器人" if is_bot else ("真人（白名单）" if source == "真人白名单" else "待观察/身份未知")
                 age = max(0.0, now - float(entry["last_ts"]))
-                lines.append(f"- {entry['uid']}：{verdict}，{entry['count']} 条，{age:.0f}s 前")
-                if not entry["is_bot"] and self.config.suspect.enabled:
-                    report = guard.check_frequency(now=now, uid=str(entry["uid"]), record=False)
-                    if report.count >= 2:
-                        lines.append(
-                            f"    发言模式：{report.count} 条 / 接话 {report.ratio * 100:.0f}%"
-                            f" / 嫌疑 {report.strikes}/{self.config.suspect.strikes_to_mark}"
-                        )
-            not_bot = [str(entry["uid"]) for entry in senders if not entry["is_bot"]]
-            if not_bot:
-                lines.append("以下账号被当成人类：")
-                lines.extend(f"  /loopguard learn {uid}" for uid in not_bot[:4])
-            lines.append("确认是机器人的账号，用 /loopguard learn <账号> 登记，或写进配置的 已知机器人账号 后重载。")
+                lines.append(f"- {uid}：{verdict}，{entry['count']} 条，{age:.0f}s 前；依据：{source}")
+                evidence = guard.identity_report(now=now, uid=uid)
+                if evidence.reasons:
+                    lines.append("    行为证据：" + "；".join(evidence.reasons))
+                if not is_bot and self.config.suspect.enabled:
+                    report = guard.check_frequency(now=now, uid=uid, record=False)
+                    lines.append(
+                        f"    发言模式：{report.count} 条 / 接话 {report.ratio * 100:.0f}%"
+                        f" / 已知bot响应 {report.bot_ratio * 100:.0f}%"
+                        f" / 独立窗口 {report.strikes}/{self.config.suspect.strikes_to_mark}"
+                    )
+            lines.append("未知身份不等于真人或bot；确认是bot后用 /loopguard learn <平台:账号> 登记；真人可加入 human_accounts 白名单。")
             return True, "\n".join(lines), True
 
         if self._registry is None:
             return False, "守卫尚未初始化", True
         target = arg or stream_id
-        guard = self._registry.get(target, now) if target else None
+        try:
+            guard = self._registry.get(target, now, platform=str(kwargs.get("platform") or "")) if target else None
+        except ValueError as exc:
+            return False, str(exc), True
         if guard is None:
             return False, "未找到指定的聊天流", True
         snap = guard.snapshot(now)
@@ -1023,18 +1092,45 @@ class LoopGuardPlugin(MaiBotPlugin):
             return
 
         now = time.time()
-        learned = payload.get("learned")
-        if isinstance(learned, dict):
-            for key, value in learned.items():
-                try:
-                    expire_at = float(value)
-                except (TypeError, ValueError):
-                    continue
-                if expire_at > now:
-                    self._learned[str(key)] = expire_at
-        streams = payload.get("streams")
-        if isinstance(streams, dict) and self._registry is not None:
-            self._registry.restore({str(k): v for k, v in streams.items() if isinstance(v, dict)}, now)
+        # v1记录混合了单次复制/@误判，且没有平台/聊天流作用域，升级时重新观察。
+        if payload.get("version") == _STATE_VERSION:
+            learned = payload.get("learned")
+            sources = payload.get("learned_sources") or {}
+            if isinstance(learned, dict):
+                for key, value in learned.items():
+                    try:
+                        scope = json.loads(key)
+                        expire_at = float(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if not isinstance(scope, list) or len(scope) != 3 or not all(isinstance(part, str) for part in scope):
+                        continue
+                    if math.isfinite(expire_at) and expire_at > now:
+                        self._learned[key] = expire_at
+                        self._learned_sources[key] = str(sources.get(key) or "manual") if isinstance(sources, dict) else "manual"
+            streams = payload.get("streams")
+            try:
+                saved_at = float(payload.get("saved_at", now))
+            except (TypeError, ValueError):
+                saved_at = now
+            elapsed = max(0.0, now - saved_at) if math.isfinite(saved_at) else 0.0
+            if isinstance(streams, dict) and self._registry is not None:
+                restored = {}
+                for key, value in streams.items():
+                    if not isinstance(value, dict):
+                        continue
+                    try:
+                        remaining = float(value.get("cooldown_remaining") or 0.0)
+                        data = dict(value, cooldown_remaining=max(0.0, remaining - elapsed))
+                        if elapsed > self.config.detect.window_seconds:
+                            data["chain_length"] = 0
+                        if math.isfinite(remaining):
+                            restored[str(key)] = data
+                    except (TypeError, ValueError):
+                        continue
+                self._registry.restore(restored, now)
+        else:
+            self.ctx.logger.info("[loopguard] 升级身份机制：旧学习名单与冷却已清理，将重新累计证据")
         stats = payload.get("stats")
         if isinstance(stats, dict):
             for key in self._stats:
@@ -1053,6 +1149,7 @@ class LoopGuardPlugin(MaiBotPlugin):
             "version": _STATE_VERSION,
             "saved_at": now,
             "learned": {key: value for key, value in self._learned.items() if value > now},
+            "learned_sources": {key: self._learned_sources.get(key, "manual") for key, value in self._learned.items() if value > now},
             "streams": self._registry.snapshot(now),
             "stats": dict(self._stats),
         }

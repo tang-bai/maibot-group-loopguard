@@ -63,7 +63,8 @@ class ConfigLabelTest(unittest.TestCase):
 
     def test_field_count_matches_config_model(self) -> None:
         total = sum(len(section["fields"]) for section in self.schema["sections"].values())
-        self.assertEqual(total, 47, f"字段数量变化了（当前 {total}），记得同步文档里的配置全表")
+        expected = sum(len(field.annotation.model_fields) for field in self.module.LoopGuardConfig.model_fields.values())
+        self.assertEqual(total, expected, "配置 Schema 字段应完整覆盖配置模型")
 
 
 if __name__ == "__main__":

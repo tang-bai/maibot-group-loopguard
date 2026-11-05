@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import logging
+import json
 import sys
 import tempfile
 import unittest
@@ -205,18 +206,14 @@ class PluginHookTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("机器人", text)
         self.assertIn("10086", text)
 
-    async def test_unknown_bot_at_known_bot_is_detected(self) -> None:
-        # 未登记的账号只 @ 了已知机器人 → 按机器人处理
+    async def test_human_at_known_bot_stays_unknown(self) -> None:
         await self.plugin.guard_incoming(message=make_message("20002", "机器人甲说一句话"))
-        decision = await self.plugin.guard_incoming(
-            message=make_message("99999", "那你觉得呢", at="10001")
-        )
-        # 这是 @ 已知机器人（10001 是自身账号）的消息，发送者被按机器人处理
-        # 第一次放行（chain=1），第二次应该被拦
-        second = await self.plugin.guard_incoming(
-            message=make_message("99999", "那你觉得呢", at="10001")
-        )
-        self.assertEqual(second, {"action": "abort"})
+        for _ in range(5):
+            result = await self.plugin.guard_incoming(message=make_message("99999", "那你觉得呢", at="10001"))
+            self.assertIsNone(result)
+        self.assertEqual(self.plugin._learned, {})
+        guard = self.plugin._registry.get("stream-1", plugin_module.time.time())
+        self.assertFalse(next(item for item in guard.senders(plugin_module.time.time()) if item["uid"] == "99999")["is_bot"])
 
     async def test_frequency_suspect_marks_bot_after_three_bursts(self) -> None:
         self.plugin.config.suspect.enabled = True
@@ -228,15 +225,15 @@ class PluginHookTest(unittest.IsolatedAsyncioTestCase):
             for turn in range(3):
                 ts = base + turn * 2
                 with unittest.mock.patch.object(plugin_module.time, "time", return_value=ts):
-                    await self.plugin.guard_incoming(message=make_message("30003", f"别人第 {turn} 句"))
+                    await self.plugin.guard_incoming(message=make_message("20002", f"别人第 {turn} 句"))
                 with unittest.mock.patch.object(plugin_module.time, "time", return_value=ts + 1):
                     await self.plugin.guard_incoming(message=make_message("40004", f"接话第 {turn} 句"))
 
         for window in range(3):
             await run_burst(float(window * 90))
 
-        self.assertIn("40004", self.plugin._learned, "三次高频响应窗口后应被标记为 bot")
-        self.assertNotIn("30003", self.plugin._learned, "只发一条的另一方不应被标记")
+        self.assertTrue(self.plugin._learned_hit("40004", 190, platform="qq", stream_id="stream-1"))
+        self.assertFalse(self.plugin._learned_hit("30003", 190, platform="qq", stream_id="stream-1"))
 
     async def test_frequency_suspect_disabled_by_default(self) -> None:
         self.assertFalse(self.plugin.config.suspect.enabled)
@@ -258,20 +255,189 @@ class PluginHookTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(intercept)
         self.assertIn("剩余冷却", text)
 
-    async def test_behavior_learning_marks_unknown_sender(self) -> None:
-        await self.plugin.guard_incoming(message=make_message("30003", "今天下午三点在会议室开个短会", nickname="路人甲"))
-        first_echo = await self.plugin.guard_incoming(
-            message=make_message("40004", "今天下午三点在会议室开个短会。", nickname="路人乙")
-        )
-        # 首次复述只登记身份、不额外惩罚（避免误伤真人引用）
-        self.assertIsNone(first_echo)
-        self.assertIn("40004", self.plugin._learned)
+    async def test_behavior_learning_requires_multiple_distinct_echoes(self) -> None:
+        samples = ["今天下午三点在会议室开个短会记得带材料", "周末准备去海边看看日落顺便拍一组照片", "服务器版本已经更新请各位重新启动客户端"]
+        for index, text in enumerate(samples):
+            await self.plugin.guard_incoming(message=make_message("20002", text))
+            result = await self.plugin.guard_incoming(message=make_message("40004", text + "。"))
+            self.assertIsNone(result, "累计证据本条仍放行")
+            learned = self.plugin._learned_hit("40004", plugin_module.time.time(), platform="qq", stream_id="stream-1")
+            self.assertEqual(learned, index == 2)
+        for text in ["先谈一点全新的活动组织方案", "然后再讨论预算和报名时间", "最后确认场地和交通路线安排", "另外还有餐饮和应急联络事宜"]:
+            result = await self.plugin.guard_incoming(message=make_message("40004", text))
+        self.assertEqual(result, {"action": "abort"})
 
-        # 上名单之后，同一账号再复述就按机器人规则拦下
-        second_echo = await self.plugin.guard_incoming(
-            message=make_message("40004", "今天下午三点在会议室开个短会，记得带材料", nickname="路人乙")
-        )
-        self.assertEqual(second_echo, {"action": "abort"})
+    async def test_single_human_copy_is_not_learned_or_blocked(self):
+        text = "今天下午三点在会议室开个短会记得带材料"
+        await self.plugin.guard_incoming(message=make_message("20002", text))
+        self.assertIsNone(await self.plugin.guard_incoming(message=make_message("40004", text)))
+        self.assertEqual(self.plugin._learned, {})
+
+    async def test_reply_quote_does_not_count_as_authored_text(self):
+        text = "今天下午三点在会议室开个短会记得带材料"
+        message = make_message("40004", "收到")
+        message["raw_message"].insert(0, {"type": "reply", "data": {"target_message_content": text}})
+        self.assertEqual(plugin_module._extract_text(message).strip(), "收到")
+        for _ in range(5):
+            await self.plugin.guard_incoming(message=make_message("20002", text))
+            self.assertIsNone(await self.plugin.guard_incoming(message=message))
+        self.assertEqual(self.plugin._learned, {})
+
+    async def test_at_component_keeps_adjacent_chinese_body(self):
+        text = "今天下午三点在会议室开个短会记得带材料"
+        message = make_message("40004", text, at="10001")
+        message["raw_message"].reverse()
+        self.assertEqual(plugin_module.normalize_text(plugin_module._extract_text(message)), text)
+        message["raw_message"] = [{"type": "text", "data": {"text": text}}]
+        self.assertEqual(plugin_module._extract_text(message), text)
+
+    async def test_human_whitelist_overrides_all_nonself_signals(self):
+        self.plugin.config.identity.human_accounts = ["qq:40004"]
+        self.plugin.config.identity.bot_accounts.append("40004")
+        self.plugin.config.identity.trust_name_patterns = True
+        self.plugin.config.identity.name_patterns = [".*"]
+        self.plugin.config.suspect.enabled = True
+        for index in range(6):
+            text = f"今天下午三点在会议室开会讨论第{index}份不同材料"
+            await self.plugin.guard_incoming(message=make_message("20002", text))
+            self.assertIsNone(await self.plugin.guard_incoming(message=make_message("40004", text, at="10001")))
+        self.assertEqual(self.plugin._learned, {})
+        self.assertFalse(self.plugin._is_bot_account("qq", "40004", "SomeBot", "", plugin_module.time.time(), "stream-1"))
+
+    async def test_nickname_is_weak_unless_explicitly_trusted(self):
+        now = plugin_module.time.time()
+        self.assertFalse(self.plugin._is_bot_account("qq", "40004", "HelpBot", "真人群名片", now))
+        self.plugin.config.identity.trust_name_patterns = True
+        self.assertTrue(self.plugin._is_bot_account("qq", "40004", "HelpBot", "真人群名片", now))
+        self.plugin.config.identity.name_patterns = []
+        self.assertFalse(self.plugin._is_bot_account("qq", "40004", "HelpBot", "", now))
+
+    async def test_auto_learning_is_scoped_by_platform_and_stream(self):
+        now = plugin_module.time.time()
+        self.plugin._remember_learned("40004", now, platform="qq", stream_id="stream-1", source="test")
+        self.assertTrue(self.plugin._learned_hit("40004", now, platform="qq", stream_id="stream-1"))
+        self.assertFalse(self.plugin._learned_hit("40004", now, platform="qq", stream_id="stream-2"))
+        self.assertFalse(self.plugin._learned_hit("40004", now, platform="telegram", stream_id="stream-1"))
+        self.assertFalse(self.plugin._learned_hit("40004", now + 4000, platform="qq", stream_id="stream-1"))
+
+    async def test_platform_specific_bot_list_does_not_match_other_platform(self):
+        self.plugin.config.identity.bot_accounts = ["telegram:40004"]
+        now = plugin_module.time.time()
+        self.assertFalse(self.plugin._is_bot_account("qq", "40004", "群友", "", now))
+        self.assertTrue(self.plugin._is_bot_account("telegram", "40004", "群友", "", now))
+        for _ in range(5):
+            self.assertIsNone(await self.plugin.guard_incoming(message=make_message("50005", "你好呀", at="40004")))
+
+    async def test_who_reports_current_identity_and_evidence(self):
+        text = "今天下午三点在会议室开个短会记得带材料"
+        await self.plugin.guard_incoming(message=make_message("20002", text))
+        await self.plugin.guard_incoming(message=make_message("40004", text))
+        result = await self.plugin.handle_command(is_local_operator=True, stream_id="stream-1", matched_groups={"sub": "who"})
+        self.assertIn("待观察/身份未知", result[1])
+        self.assertIn("回声1次", result[1])
+        self.plugin._remember_learned("40004", plugin_module.time.time(), platform="qq", stream_id="stream-1", source="test")
+        result = await self.plugin.handle_command(is_local_operator=True, stream_id="stream-1", matched_groups={"sub": "who"})
+        self.assertIn("临时学习：test", result[1])
+
+    async def test_missing_session_uses_same_stable_group_guard(self):
+        text = "今晚一起打游戏吗我这边随时可以"
+        message = make_message("20002", text)
+        message.pop("session_id")
+        self.assertIsNone(await self.plugin.guard_incoming(message=message))
+        message["message_id"] = "different-id"
+        self.assertEqual(await self.plugin.guard_incoming(message=message), {"action": "abort"})
+        outgoing = make_message("10001", "这是一条全新的出站消息")
+        outgoing.pop("session_id")
+        self.assertEqual(await self.plugin.guard_outgoing(message=outgoing), {"action": "abort"})
+
+    async def test_missing_sender_does_not_clear_cooldown(self):
+        text = "今晚一起打游戏吗我这边随时可以"
+        await self.plugin.guard_incoming(message=make_message("20002", text))
+        await self.plugin.guard_incoming(message=make_message("20002", text))
+        now = plugin_module.time.time()
+        guard = self.plugin._registry.get("stream-1", now)
+        await self.plugin.guard_incoming(message=make_message("", "系统通知"))
+        self.assertGreater(guard.cooldown_remaining(now), 0)
+
+    async def test_dry_run_never_modifies_planner_tools(self):
+        self.plugin.config.action.soft_mute_reply_tool = True
+        self.plugin.config.plugin.dry_run = True
+        text = "今晚一起打游戏吗我这边随时可以"
+        await self.plugin.guard_incoming(message=make_message("20002", text))
+        await self.plugin.guard_incoming(message=make_message("20002", text))
+        tools = [{"function": {"name": "reply"}}]
+        result = await self.plugin.soft_mute_planner(session_id="stream-1", tool_definitions=tools)
+        self.assertIsNone(result)
+        self.assertEqual(len(tools), 1)
+
+    async def test_manual_learn_and_forget_respect_platform_prefix(self):
+        result = await self.plugin.handle_command(is_local_operator=True, stream_id="stream-1", matched_groups={"sub": "learn", "arg": "qq:40004"})
+        self.assertTrue(result[0])
+        now = plugin_module.time.time()
+        self.assertTrue(self.plugin._learned_hit("40004", now, platform="qq", stream_id="stream-1"))
+        self.assertFalse(self.plugin._learned_hit("40004", now, platform="telegram", stream_id="stream-1"))
+        await self.plugin.handle_command(is_local_operator=True, matched_groups={"sub": "forget", "arg": "qq:40004"})
+        self.assertFalse(self.plugin._learned_hit("40004", now, platform="qq", stream_id="stream-1"))
+
+    async def test_old_state_drops_unscoped_single_signal_learning(self):
+        self.plugin._state_path.write_text(json.dumps({"version": 1, "learned": {"40004": plugin_module.time.time() + 9999}}), encoding="utf-8")
+        self.plugin._load_state()
+        self.assertEqual(self.plugin._learned, {})
+
+    async def test_mixed_platform_sessions_never_share_identity_evidence(self):
+        self.plugin.config.identity.platform_scope = []
+        self.plugin.config.identity.bot_accounts = ["qq:20002"]
+        samples = ["今天下午三点在会议室开个短会记得带材料", "周末准备去海边看看日落顺便拍一组照片", "服务器版本已经更新请各位重新启动客户端"]
+        for index, text in enumerate(samples):
+            await self.plugin.guard_incoming(message=make_message("20002", text, session="same"))
+            platform = "qq" if index < 2 else "telegram"
+            await self.plugin.guard_incoming(message=make_message("40004", text, platform=platform, session="same"))
+        self.assertEqual(self.plugin._learned, {})
+        now = plugin_module.time.time()
+        qq = self.plugin._registry.get("same", now, platform="qq")
+        tg = self.plugin._registry.get("same", now, platform="telegram")
+        self.assertEqual(qq.identity_report(now=now, uid="40004").echoes, 2)
+        self.assertEqual(tg.identity_report(now=now, uid="40004").echoes, 0)
+
+    async def test_expired_learning_needs_fresh_unknown_evidence(self):
+        self.plugin.config.identity.learned_ttl_seconds = 60
+        samples = ["今天下午三点在会议室开个短会记得带材料", "周末准备去海边看看日落顺便拍一组照片", "服务器版本已经更新请各位重新启动客户端"]
+        for index, text in enumerate(samples):
+            with unittest.mock.patch.object(plugin_module.time, "time", return_value=index * 2):
+                await self.plugin.guard_incoming(message=make_message("20002", text))
+            with unittest.mock.patch.object(plugin_module.time, "time", return_value=index * 2 + 1):
+                await self.plugin.guard_incoming(message=make_message("40004", text))
+        self.assertTrue(self.plugin._learned_hit("40004", 6, platform="qq", stream_id="stream-1"))
+        with unittest.mock.patch.object(plugin_module.time, "time", return_value=66):
+            await self.plugin.guard_incoming(message=make_message("40004", "我刚才去买了一杯咖啡现在已经回来了"))
+        self.assertFalse(self.plugin._learned_hit("40004", 66, platform="qq", stream_id="stream-1"))
+
+    async def test_who_can_select_platform_when_session_names_collide(self):
+        self.plugin.config.identity.platform_scope = []
+        for platform in ("qq", "telegram"):
+            await self.plugin.guard_incoming(message=make_message("40004", "普通消息", platform=platform, session="same"))
+        self.plugin._remember_learned("40004", plugin_module.time.time(), platform="qq", stream_id="same", source="test")
+        result = await self.plugin.handle_command(is_local_operator=True, matched_groups={"sub": "who", "arg": "same"})
+        self.assertFalse(result[0])
+        result = await self.plugin.handle_command(is_local_operator=True, matched_groups={"sub": "who", "arg": "qq:same"})
+        self.assertTrue(result[0])
+        self.assertIn("临时学习：test", result[1])
+
+    async def test_restart_subtracts_elapsed_cooldown_and_preserves_scope(self):
+        now = plugin_module.time.time()
+        self.plugin._remember_learned("40004", now, platform="qq", stream_id="stream-1", source="test")
+        text = "今晚一起打游戏吗我这边随时可以"
+        await self.plugin.guard_incoming(message=make_message("20002", text))
+        await self.plugin.guard_incoming(message=make_message("20002", text))
+        await self.plugin._flush_state()
+        self.plugin._learned.clear()
+        self.plugin._learned_sources.clear()
+        self.plugin._registry = plugin_module.GuardRegistry(self.plugin._build_params())
+        with unittest.mock.patch.object(plugin_module.time, "time", return_value=now + 1000):
+            self.plugin._load_state()
+        self.assertTrue(self.plugin._learned_hit("40004", now + 1000, platform="qq", stream_id="stream-1"))
+        self.assertFalse(self.plugin._learned_hit("40004", now + 1000, platform="telegram", stream_id="stream-1"))
+        self.assertEqual(self.plugin._registry.get("stream-1", now + 1000).cooldown_remaining(now + 1000), 0)
 
 
 class NoLoopTest(unittest.IsolatedAsyncioTestCase):

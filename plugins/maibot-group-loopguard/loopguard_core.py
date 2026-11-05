@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import unicodedata
 from collections import deque
@@ -23,6 +24,8 @@ __all__ = [
     "GuardParams",
     "Decision",
     "MessageRecord",
+    "IdentityReport",
+    "FrequencyReport",
     "StreamGuard",
     "normalize_text",
     "simhash64",
@@ -39,7 +42,6 @@ _RUN_RE = re.compile(r"(.)\1{2,}", re.DOTALL)
 _DIGEST_LEN = 16
 
 # 行为学习的判据：短时间内的逐字/高包含度复述才算"机器人回声"
-_ECHO_WINDOW_SECONDS = 30.0
 _ECHO_MIN_LENGTH = 8
 _ECHO_CONTAINMENT = 0.9
 
@@ -198,6 +200,10 @@ class GuardParams:
     suspect_responsive_within_seconds: float = 12.0
     suspect_strikes_to_mark: int = 3
     suspect_strike_ttl_seconds: float = 600.0
+    identity_min_echoes: int = 3
+    identity_window_seconds: float = 180.0
+    identity_min_text_length: int = 12
+    identity_response_within_seconds: float = 60.0
 
 
 @dataclass(slots=True)
@@ -211,6 +217,14 @@ class MessageRecord:
     simhash: int
     normalized: str
     preview: str
+    responsive: bool = False
+    bot_response: bool = False
+    echo_source: str = ""
+    echo_anchored: bool = False
+    platform: str = ""
+    nickname: str = ""
+    cardname: str = ""
+    identity_source: str = ""
 
 
 @dataclass(slots=True)
@@ -240,10 +254,25 @@ class FrequencyReport:
 
     count: int = 0
     responsive: int = 0
+    bot_responsive: int = 0
     ratio: float = 0.0
+    bot_ratio: float = 0.0
     strikes: int = 0
     suspect: bool = False
     mark: bool = False
+
+
+@dataclass(slots=True)
+class IdentityReport:
+    """行为证据计数；这些是启发式信号，而非真实身份概率。"""
+
+    count: int = 0
+    echoes: int = 0
+    distinct_echoes: int = 0
+    bot_responses: int = 0
+    suspect: bool = False
+    mark: bool = False
+    reasons: tuple[str, ...] = ()
 
 
 class StreamGuard:
@@ -259,6 +288,8 @@ class StreamGuard:
 
     def __init__(self, params: Optional[GuardParams] = None) -> None:
         self.params = params or GuardParams()
+        self.platform = ""
+        self.stream_id = ""
         self._records: Deque[MessageRecord] = deque(maxlen=max(8, self.params.max_records))
         self._chain_length = 0
         self._strike = 0
@@ -268,8 +299,8 @@ class StreamGuard:
         self._allowed_bot = 0
         self._last_reason = ""
         self._outgoing: Deque[MessageRecord] = deque(maxlen=10)
-        self._suspect_strikes: Deque[float] = deque(maxlen=8)
-        self._last_suspect_ts = float("-inf")
+        self._suspect_strikes: dict[str, Deque[float]] = {}
+        self._last_suspect_ts: dict[str, float] = {}
 
     # ── 状态读取 ────────────────────────────────────────────────
     @property
@@ -317,7 +348,8 @@ class StreamGuard:
     def restore(self, data: dict[str, object], now: float) -> None:
         """从快照恢复关键状态（窗口内指纹不持久化）。"""
 
-        self._chain_length = int(data.get("chain_length") or 0)
+        # 指纹未持久化，重启只恢复冷却/统计，不恢复缺少消息依据的链条。
+        self._chain_length = 0
         self._strike = int(data.get("strike") or 0)
         remaining = float(data.get("cooldown_remaining") or 0.0)
         self._cooldown_until = now + max(0.0, remaining)
@@ -329,9 +361,21 @@ class StreamGuard:
     def _prune(self, now: float) -> None:
         """丢弃窗口外的历史指纹。"""
 
-        horizon = now - max(1.0, self.params.window_seconds)
+        horizon = now - max(1.0, self.params.window_seconds, self.params.identity_window_seconds, self.params.suspect_window_seconds)
         while self._records and self._records[0].ts < horizon:
             self._records.popleft()
+        while self._outgoing and self._outgoing[0].ts < now - max(1.0, self.params.window_seconds):
+            self._outgoing.popleft()
+        if not self._records or self._records[-1].ts < now - max(1.0, self.params.window_seconds):
+            self._chain_length = 0
+        ttl = max(10.0, self.params.suspect_strike_ttl_seconds)
+        for uid in list(self._suspect_strikes):
+            strikes = self._suspect_strikes[uid]
+            while strikes and now - strikes[0] > ttl:
+                strikes.popleft()
+            if not strikes:
+                self._suspect_strikes.pop(uid, None)
+                self._last_suspect_ts.pop(uid, None)
 
     def _recent_bot_records(self, now: float, window: float) -> list[MessageRecord]:
         """取时间窗内的机器人消息。"""
@@ -383,7 +427,7 @@ class StreamGuard:
         if not all(record.is_bot for record in tail):
             return False
         senders = [record.uid for record in tail]
-        return len(set(senders)) == 2
+        return len(set(senders)) == 2 and all(left != right for left, right in zip(senders, senders[1:]))
 
     def _burst(self, now: float) -> bool:
         """检测短时间内机器人消息爆发。"""
@@ -404,69 +448,73 @@ class StreamGuard:
 
     # ── 主判定 ──────────────────────────────────────────────────
     def check_frequency(self, *, now: float, uid: str, record: bool = True) -> FrequencyReport:
-        """评估某个账号是否呈现出"被触发型 bot"的发言模式。
+        """按账号累计独立窗口；接话只看紧邻前驱，且要求已知 bot 锚点。
 
-        判定分两步，缺一不可：
-        1. 窗口内发言次数达到阈值，**且响应式发言占比达标**；
-        2. 上述高频窗口累计出现 N 次（同一波只记一次，过期自动作废）。
-
-        举例：真人群友连发 6 句"哈哈/笑死/真的吗"，响应式占比接近 0，直接排除；
-        两只 bot 互聊时 A-B-A-B 每条都接在别人后面，占比接近 100%。
-
-        Args:
-            now: 当前时间戳（秒）。
-            uid: 待评估的账号。
-            record: 是否把本次评估写进嫌疑计数。`/loopguard who` 这类
-                查询命令应传 False，否则看一眼状态就会把人标记成 bot。
-
-        Returns:
-            FrequencyReport: `mark=True` 时调用方应把该账号标记为机器人。
+        普通真人相互聊天即便很快也只给 suspect，不自动标记。
+        record=False 只读证据，不新增嫌疑窗口或触发标记。
         """
 
         self._prune(now)
         params = self.params
+        uid = str(uid or "")
         window = max(10.0, params.suspect_window_seconds)
-        horizon = now - window
-        messages = sorted(
-            (record for record in self._records if record.uid == str(uid or "") and record.ts >= horizon),
-            key=lambda record: record.ts,
-        )
-        report = FrequencyReport(count=len(messages))
-
-        if report.count < max(2, params.suspect_min_messages):
+        messages = [item for item in self._records if item.uid == uid and not item.is_bot and 0 <= now - item.ts <= window]
+        strikes = self._suspect_strikes.get(uid, ())
+        report = FrequencyReport(count=len(messages), strikes=len(strikes))
+        report.responsive = sum(item.responsive for item in messages)
+        report.bot_responsive = sum(item.bot_response for item in messages)
+        if not messages:
             return report
-
-        within = max(1.0, params.suspect_responsive_within_seconds)
-        for message in messages:
-            # 向前找最近的"别人"的发言：紧跟在别人后面才算响应式
-            previous = next(
-                (
-                    other
-                    for other in reversed(self._records)
-                    if other.ts <= message.ts and other.uid != message.uid
-                ),
-                None,
-            )
-            if previous is not None and message.ts - previous.ts <= within:
-                report.responsive += 1
-
-        report.ratio = report.responsive / report.count if report.count else 0.0
+        report.ratio = report.responsive / report.count
+        report.bot_ratio = report.bot_responsive / report.count
+        if not uid or report.count < max(2, params.suspect_min_messages):
+            return report
         if report.ratio < params.suspect_responsive_ratio:
             return report
-
         report.suspect = True
-        # 同一波高频只记一次；首次评估时 _last_suspect_ts 为 -inf，不会被挡
-        report.strikes = len(self._suspect_strikes)
-        if not record or (now - self._last_suspect_ts) < window:
+        # 频率与快速回复都不是身份凭据。只有多轮响应已知 bot 才积累标记证据。
+        anchored = report.bot_responsive >= 2 and report.bot_ratio >= params.suspect_responsive_ratio
+        if not anchored or not record:
             return report
-
-        self._last_suspect_ts = now
-        self._suspect_strikes.append(now)
-        ttl = max(window, params.suspect_strike_ttl_seconds)
-        while self._suspect_strikes and now - self._suspect_strikes[0] > ttl:
-            self._suspect_strikes.popleft()
-        report.strikes = len(self._suspect_strikes)
+        if now - self._last_suspect_ts.get(uid, float("-inf")) < window:
+            return report
+        # 不允许同一批消息在滑动窗口边界重复贡献证据。
+        fresh = [item for item in messages if item.ts > self._last_suspect_ts.get(uid, float("-inf"))]
+        if len(fresh) < max(2, params.suspect_min_messages):
+            return report
+        self._last_suspect_ts[uid] = now
+        bucket = self._suspect_strikes.setdefault(uid, deque(maxlen=max(8, params.suspect_strikes_to_mark)))
+        bucket.append(now)
+        report.strikes = len(bucket)
         report.mark = report.strikes >= max(1, params.suspect_strikes_to_mark)
+        return report
+
+    def identity_report(self, *, now: float, uid: str) -> IdentityReport:
+        """对已观察的消息做多轮回声评估，不因一次复制/昵称/@直接定性。"""
+
+        self._prune(now)
+        window = max(10.0, self.params.identity_window_seconds)
+        messages = [item for item in self._records if item.uid == uid and not item.is_bot and 0 <= now - item.ts <= window]
+        echoes = [item for item in messages if item.echo_source]
+        report = IdentityReport(
+            count=len(messages),
+            echoes=len(echoes),
+            distinct_echoes=len({item.echo_source for item in echoes}),
+            bot_responses=sum(item.bot_response for item in messages),
+        )
+        minimum = max(3, self.params.identity_min_echoes)
+        anchored_echoes = sum(item.echo_anchored for item in echoes)
+        # 优先使用已知机器人的不同内容作锚点；全未知场景需要更多独立回声。
+        anchored = report.echoes >= minimum and anchored_echoes >= 2 and report.distinct_echoes >= 2
+        unanchored = report.echoes >= minimum + 1 and report.distinct_echoes >= 3
+        report.mark = anchored or unanchored
+        report.suspect = bool(echoes)
+        reasons = []
+        if echoes:
+            reasons.append(f"回声{report.echoes}次/不同来源文本{report.distinct_echoes}种")
+        if report.bot_responses:
+            reasons.append(f"响应已知bot{report.bot_responses}次")
+        report.reasons = tuple(reasons)
         return report
 
     def senders(self, now: float) -> list[dict[str, object]]:
@@ -494,49 +542,67 @@ class StreamGuard:
                     "is_bot": False,
                     "last_ts": record.ts,
                     "preview": record.preview,
+                    "platform": record.platform,
+                    "nickname": record.nickname,
+                    "cardname": record.cardname,
+                    "identity_source": record.identity_source,
                 },
             )
             entry["count"] = int(entry["count"]) + 1
-            entry["is_bot"] = bool(entry["is_bot"]) or record.is_bot
+            entry["is_bot"] = record.is_bot
+            entry["platform"] = record.platform
+            entry["nickname"] = record.nickname
+            entry["cardname"] = record.cardname
+            entry["identity_source"] = record.identity_source
+            entry["preview"] = record.preview
             entry["last_ts"] = max(float(entry["last_ts"]), record.ts)
         return sorted(stats.values(), key=lambda item: float(item["last_ts"]), reverse=True)
 
-    def looks_like_bot_echo(self, *, now: float, uid: str, text: str) -> bool:
-        """判断一条"身份未知"的消息是否在复述刚刚出现过的内容。
+    def _echo_source(self, candidate: MessageRecord) -> Optional[MessageRecord]:
+        """找回声来源，双方均需足够长，避免短子串包含造成误判。"""
 
-        用于行为层面识别未登记在册的机器人：真人群友很少在几十秒内发出与另一个
-        账号几乎逐字相同的内容，而两个机器人实例会高频互抄——哪怕它们都没被
-        登记进名单，第一条复述就能把后来者钉住。
-
-        判定条件（三个同时满足）：
-        - 与某条**其它账号**的历史消息 2-gram 包含度 ≥ 0.9 或逐字相同；
-        - 两条消息间隔 ≤ 30 秒；
-        - 规范化后长度 ≥ 8，避免把"+1""哈哈"当成复读。
-
-        Args:
-            now: 当前时间戳（秒）。
-            uid: 候选发送者账号。
-            text: 候选消息文本。
-
-        Returns:
-            bool: 命中视为机器人回声。
-        """
-
-        self._prune(now)
-        candidate = self._make_record(now, uid, True, text)
-        if len(candidate.normalized) < max(self.params.min_text_length, _ECHO_MIN_LENGTH):
-            return False
-
-        for record in self._records:
-            if record.uid == str(uid or "") or not record.normalized:
+        minimum = max(_ECHO_MIN_LENGTH, self.params.min_text_length, self.params.identity_min_text_length)
+        if len(candidate.normalized) < minimum:
+            return None
+        for record in reversed(self._records):
+            if record.uid == candidate.uid or not record.uid:
                 continue
-            if now - record.ts > _ECHO_WINDOW_SECONDS:
+            if not 0 <= candidate.ts - record.ts <= max(1.0, self.params.identity_response_within_seconds):
+                continue
+            if len(record.normalized) < minimum:
+                continue
+            ratio = min(len(record.normalized), len(candidate.normalized)) / max(len(record.normalized), len(candidate.normalized))
+            if ratio < 0.65:
                 continue
             if record.digest == candidate.digest:
-                return True
+                return record
             if bigram_containment(candidate.normalized, record.normalized) >= _ECHO_CONTAINMENT:
-                return True
-        return False
+                return record
+        return None
+
+    def looks_like_bot_echo(self, *, now: float, uid: str, text: str) -> bool:
+        """单次回声信号，仅供观测；身份提升由 identity_report 多轮证据决定。"""
+
+        self._prune(now)
+        return self._echo_source(self._make_record(now, uid, False, text)) is not None
+
+    def consume_identity(self, uid: str) -> None:
+        """提升身份时消耗证据；过期后须用新证据重新观察。"""
+
+        self._suspect_strikes.pop(uid, None)
+        self._last_suspect_ts.pop(uid, None)
+        for item in self._records:
+            if item.uid == uid:
+                item.echo_source = ""
+                item.echo_anchored = False
+                item.responsive = False
+                item.bot_response = False
+
+    def forget_identity(self, uid: str) -> None:
+        self.consume_identity(uid)
+        for item in self._records:
+            if item.uid == uid:
+                item.is_bot = False
 
     def observe_human(self, now: float, uid: str = "") -> None:
         """记录一条人类消息：清零链条、衰减退避档位。"""
@@ -556,6 +622,10 @@ class StreamGuard:
         text: str,
         is_self: bool = False,
         is_arbiter_primary: bool = True,
+        platform: str = "",
+        nickname: str = "",
+        cardname: str = "",
+        identity_source: str = "",
     ) -> Decision:
         """判定一条入站消息是否应当进入 MaiBot 主链。
 
@@ -573,11 +643,10 @@ class StreamGuard:
 
         self._prune(now)
         record = self._make_record(now, uid, is_bot, text)
-        self._records.append(record)
-
-        if not is_bot:
-            self.observe_human(now, uid)
-            return Decision(allow=True, reason="human")
+        record.platform = platform
+        record.nickname = nickname
+        record.cardname = cardname
+        record.identity_source = identity_source
 
         if is_self:
             # 自己的消息回灌（适配器回声 / 多账号转发）直接丢，且不计入退避档位。
@@ -585,9 +654,26 @@ class StreamGuard:
             self._last_reason = "self_echo"
             return Decision(allow=False, reason="self_echo", chain_length=self._chain_length)
 
+        previous = self._records[-1] if self._records else None
+        if previous is not None and previous.uid and previous.uid != record.uid:
+            delay = now - previous.ts
+            record.responsive = 0 <= delay <= max(1.0, self.params.suspect_responsive_within_seconds)
+            record.bot_response = record.responsive and previous.is_bot
+        source = self._echo_source(record)
+        if source is not None and previous is not None and previous.uid != record.uid:
+            delay = now - previous.ts
+            if 0 <= delay <= max(1.0, self.params.identity_response_within_seconds):
+                record.echo_source = source.digest
+                record.echo_anchored = source.is_bot and previous.uid == source.uid
+        self._records.append(record)
+
+        if not is_bot:
+            self.observe_human(now, uid)
+            return Decision(allow=True, reason="human")
+
         self._chain_length += 1
         remaining = self.cooldown_remaining(now)
-        pool = [item for item in self._records if item.is_bot and item is not record]
+        pool = [item for item in self._records if item.is_bot and item is not record and 0 <= now - item.ts <= self.params.window_seconds]
         duplicate = self._matches_any(record, pool)
         pingpong = self._pingpong(now)
         burst = self._burst(now)
@@ -663,7 +749,7 @@ class StreamGuard:
         if self.params.arbiter_enabled:
             max_chain = max(2, self.params.max_chain_length - 1)
 
-        pool = [item for item in self._records if item.is_bot]
+        pool = [item for item in self._records if item.is_bot and 0 <= now - item.ts <= self.params.window_seconds]
         pool.extend(self._outgoing)
         duplicate = self._matches_any(record, pool)
 
@@ -705,14 +791,37 @@ class GuardRegistry:
         self._guards: dict[str, StreamGuard] = {}
         self._touched: dict[str, float] = {}
 
-    def get(self, stream_id: str, now: float) -> StreamGuard:
-        """取出或创建指定聊天流的状态机。"""
+    @staticmethod
+    def _scope_parts(key: str) -> tuple[str, str]:
+        try:
+            parts = json.loads(key)
+        except (TypeError, ValueError):
+            return "", key
+        if isinstance(parts, list) and len(parts) == 2 and all(isinstance(item, str) for item in parts):
+            return parts[0], parts[1]
+        return "", key
 
-        guard = self._guards.get(stream_id)
+    def _matching_keys(self, stream_id: str) -> list[str]:
+        return [key for key in self._guards
+                if key == stream_id or self._scope_parts(key)[1] == stream_id
+                or ":".join(self._scope_parts(key)) == stream_id]
+
+    def get(self, stream_id: str, now: float, *, platform: str = "") -> StreamGuard:
+        """平台与聊天流共同隔离证据及冷却。无平台的查询只允许唯一匹配。"""
+
+        key = json.dumps([platform.lower(), stream_id], separators=(",", ":")) if platform else stream_id
+        if not platform and key not in self._guards:
+            matches = self._matching_keys(stream_id)
+            if len(matches) > 1:
+                raise ValueError("同名聊天流存在多个平台，请使用 平台:stream_id 查询")
+            if matches:
+                key = matches[0]
+        guard = self._guards.get(key)
         if guard is None:
             guard = StreamGuard(self.params)
-            self._guards[stream_id] = guard
-        self._touched[stream_id] = now
+            self._guards[key] = guard
+        guard.platform, guard.stream_id = self._scope_parts(key)
+        self._touched[key] = now
         if len(self._guards) > self.max_streams:
             self._evict(now)
         return guard
@@ -742,16 +851,24 @@ class GuardRegistry:
                 continue
             guard = StreamGuard(self.params)
             guard.restore(payload, now)
+            guard.platform, guard.stream_id = self._scope_parts(str(stream_id))
             self._guards[str(stream_id)] = guard
             self._touched[str(stream_id)] = now
+
+    def forget_identity(self, uid: str, *, platform: str = "") -> None:
+        for guard in self._guards.values():
+            if not platform or guard.platform == platform.lower():
+                guard.forget_identity(uid)
 
     def reset(self, stream_id: str = "") -> list[str]:
         """重置指定流（留空则全部）并返回被重置的流 ID 列表。"""
 
         if stream_id:
-            self._guards.pop(stream_id, None)
-            self._touched.pop(stream_id, None)
-            return [stream_id]
+            keys = self._matching_keys(stream_id)
+            for key in keys:
+                self._guards.pop(key, None)
+                self._touched.pop(key, None)
+            return keys
         cleared = list(self._guards)
         self._guards.clear()
         self._touched.clear()

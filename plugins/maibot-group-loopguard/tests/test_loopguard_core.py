@@ -228,7 +228,7 @@ class FrequencySuspectTest(unittest.TestCase):
             base = float(window * 90)
             for turn in range(3):
                 ts = base + turn * 2
-                guard.evaluate(now=ts, uid="other", is_bot=False, text=f"别人说的第 {turn} 句")
+                guard.evaluate(now=ts, uid="other", is_bot=True, text=f"别人说的第 {turn} 句")
                 guard.evaluate(now=ts + 1, uid="candidate", is_bot=False, text=f"接话第 {turn} 句")
             report = guard.check_frequency(now=base + 8, uid="candidate")
             if report.mark:
@@ -239,7 +239,7 @@ class FrequencySuspectTest(unittest.TestCase):
         guard = self.make_guard(suspect_min_messages=3)
         for turn in range(3):
             ts = float(turn * 2)
-            guard.evaluate(now=ts, uid="other", is_bot=False, text=f"别人 {turn}")
+            guard.evaluate(now=ts, uid="other", is_bot=True, text=f"别人 {turn}")
             guard.evaluate(now=ts + 1, uid="candidate", is_bot=False, text=f"接话 {turn}")
         first = guard.check_frequency(now=8.0, uid="candidate")
         second = guard.check_frequency(now=9.0, uid="candidate")
@@ -258,7 +258,7 @@ class FrequencySuspectTest(unittest.TestCase):
         guard = self.make_guard(suspect_min_messages=3)
         for turn in range(3):
             ts = float(turn * 2)
-            guard.evaluate(now=ts, uid="other", is_bot=False, text=f"别人 {turn}")
+            guard.evaluate(now=ts, uid="other", is_bot=True, text=f"别人 {turn}")
             guard.evaluate(now=ts + 1, uid="candidate", is_bot=False, text=f"接话 {turn}")
         before = len(guard._suspect_strikes)
         peek = guard.check_frequency(now=8.0, uid="candidate", record=False)
@@ -280,7 +280,7 @@ class RegistryTest(unittest.TestCase):
         restored = GuardRegistry(GuardParams())
         restored.restore(snapshot, 2.0)
         restored_guard = restored.get("stream-1", 2.0)
-        self.assertEqual(restored_guard.chain_length, 1)
+        self.assertEqual(restored_guard.chain_length, 0, "重启时无指纹依据，仅恢复冷却及统计")
         self.assertEqual(restored_guard.suppressed, 0)
 
     def test_reset_clears_streams(self) -> None:
